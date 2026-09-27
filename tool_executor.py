@@ -5,8 +5,15 @@ import socket
 import time
 import urllib.error
 
+from pydantic import ValidationError
+
 from tool_result import ERROR_POLICIES, ErrorCode, ToolResult
-from tools import TOOLS, ToolAuthenticationError, UnsafeRequestError, validate_tool_arguments
+from tools import (
+    TOOLS,
+    ToolAuthenticationError,
+    UnsafeRequestError,
+    validate_tool_arguments,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -62,16 +69,33 @@ class ToolExecutor:
             try:
                 # 4. 使用模型生成的参数执行真正的工具函数
                 value = tool.function(**args)
+
+                # 5. 使用 Pydantic 校验并将业务返回值规范化为 JSON 可序列化数据
+                try:
+                    # validated_output：通过 Pydantic 返回模型校验的业务结果
+                    validated_output = tool.output_model.model_validate(value)
+
+                    # serialized_value：已转换为标准 JSON 类型的工具业务结果
+                    serialized_value = validated_output.model_dump(mode="json")
+                except ValidationError as error:
+                    return ToolResult.failure(
+                        name,
+                        ErrorCode.INVALID_OUTPUT,
+                        self._format_output_error(error),
+                        duration_ms=self._elapsed_ms(started_at),
+                        attempts=attempt,
+                    )
+
                 if attempt > 1:
                     logger.info("✅ 工具第 %d 次执行成功", attempt)
                 return ToolResult.success(
                     name,
-                    value,
+                    serialized_value,
                     duration_ms=self._elapsed_ms(started_at),
                     attempts=attempt,
                 )
             except UnsafeRequestError as error:
-                # 5. 安全拦截属于不可重试错误，立即返回
+                # 6. 安全拦截属于不可重试错误，立即返回
                 return ToolResult.failure(
                     name,
                     ErrorCode.UNSAFE_REQUEST,
@@ -80,7 +104,7 @@ class ToolExecutor:
                     attempts=attempt,
                 )
             except (ValueError, SyntaxError, ArithmeticError) as error:
-                # 6. 工具发现参数语义错误时交给模型修正，不重复执行
+                # 7. 工具发现参数语义错误时交给模型修正，不重复执行
                 return ToolResult.failure(
                     name,
                     ErrorCode.INVALID_ARGUMENTS,
@@ -89,7 +113,7 @@ class ToolExecutor:
                     attempts=attempt,
                 )
             except Exception as error:
-                # 7. 将网络、超时、限流等基础设施异常转换为稳定错误码
+                # 8. 将网络、超时、限流等基础设施异常转换为稳定错误码
                 error_code, message = self._classify_exception(error)
                 result = ToolResult.failure(
                     name,
@@ -103,7 +127,7 @@ class ToolExecutor:
                     ),
                 )
 
-                # 8. 只有可自动重试、幂等且仍有次数的工具才允许再次执行
+                # 9. 只有可自动重试、幂等且仍有次数的工具才允许再次执行
                 can_retry = (
                     result.auto_retryable
                     and tool.idempotent
@@ -112,7 +136,7 @@ class ToolExecutor:
                 if not can_retry:
                     return result
 
-                # 9. 按指数退避和随机抖动计算等待时间，避免连续冲击服务
+                # 10. 按指数退避和随机抖动计算等待时间，避免连续冲击服务
                 delay = self._retry_delay(policy, attempt)
                 logger.warning(
                     "⚠️ 工具第 %d 次执行失败：%s，%.2f 秒后重试",
@@ -123,6 +147,23 @@ class ToolExecutor:
                 self.sleeper(delay)
 
         raise RuntimeError("工具执行器进入了不可达状态")
+
+    # 将 Pydantic 校验错误压缩为可安全返回的简短说明
+    # error：Pydantic 返回模型校验失败异常
+    @staticmethod
+    def _format_output_error(error):
+        # details：不包含原始输入和文档链接的结构化错误列表
+        details = error.errors(include_url=False, include_input=False)
+
+        # first_error：用于向 Agent 报告的第一个契约错误
+        first_error = details[0]
+
+        # location：发生输出契约错误的字段路径
+        location = ".".join(str(part) for part in first_error.get("loc", ())) or "value"
+
+        # message：Pydantic 生成的简短校验失败原因
+        message = first_error.get("msg", "未知输出校验错误")
+        return f"工具返回值不符合输出约定：{location}: {message}"
 
     # 将基础设施异常转换为稳定的错误码和安全说明
     # error：工具执行时抛出的原始异常

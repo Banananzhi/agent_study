@@ -15,3 +15,5 @@ wheels/
 
 # Local secrets
 .env
+
+/tests/

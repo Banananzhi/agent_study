@@ -1,4 +1,5 @@
 import ast
+import copy
 import ipaddress
 import json
 import operator
@@ -11,6 +12,15 @@ from datetime import datetime, timedelta, timezone as fixed_timezone
 from html.parser import HTMLParser
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import BaseModel
+
+from tool_models import (
+    CalculatorOutput,
+    CurrentTimeOutput,
+    ReadWebpageOutput,
+    WebSearchOutput,
+)
 
 
 OPS = {
@@ -176,7 +186,7 @@ def get_current_time(timezone="Asia/Shanghai"):
                 raise ValueError(f"未知时区：{timezone}") from error
         else:
             raise ValueError(f"当前环境没有时区数据，暂不支持：{timezone}")
-    return datetime.now(zone).isoformat(timespec="seconds")
+    return datetime.now(zone).replace(microsecond=0)
 
 
 @dataclass(frozen=True)
@@ -201,13 +211,33 @@ class Tool:
     function: Callable[..., object]
     schema: dict
     display_name: str
+    output_model: type[BaseModel]
     retry_policy: RetryPolicy = RetryPolicy()
     idempotent: bool = True
+
+    # 校验工具的输入、输出 Schema 和显示名称
+    def __post_init__(self):
+        if not isinstance(self.schema, dict) or self.schema.get("type") != "function":
+            raise ValueError("工具输入 Schema 必须是标准 function 类型")
+        if not isinstance(self.output_model, type) or not issubclass(self.output_model, BaseModel):
+            raise ValueError("工具 output_model 必须是 Pydantic BaseModel 子类")
+
+        # output_schema：由 Pydantic 返回模型自动生成的 JSON Schema
+        output_schema = self.output_model.model_json_schema()
+        if not isinstance(output_schema.get("description"), str) or not output_schema["description"].strip():
+            raise ValueError("工具 output_model 必须包含返回值说明")
+        if not isinstance(self.display_name, str) or not self.display_name.strip():
+            raise ValueError("工具 display_name 不能为空")
 
     # 获取工具在注册表中的标准名称
     @property
     def name(self):
         return self.schema["function"]["name"]
+
+    # 获取由 Pydantic 返回模型自动生成的 Output Schema
+    @property
+    def output_schema(self):
+        return self.output_model.model_json_schema()
 
 
 CALCULATOR_SCHEMA = {
@@ -304,10 +334,18 @@ TOOLS = {}
 # 将工具函数及其完整 Schema 注册到工具表
 # function：实际执行工具逻辑的函数
 # schema：标准 Function Tool Schema
+# output_model：用于校验、序列化和生成 Schema 的 Pydantic 返回模型
 # display_name：ReAct 日志中的显示名称
 # retry_policy：工具重试策略
 # idempotent：工具能否安全地重复执行
-def register_tool(function, schema, display_name, retry_policy=None, idempotent=True):
+def register_tool(
+    function,
+    schema,
+    output_model,
+    display_name,
+    retry_policy=None,
+    idempotent=True,
+):
     if schema.get("type") != "function" or not isinstance(schema.get("function"), dict):
         raise ValueError("工具 Schema 必须是标准 function 类型")
     definition = schema["function"]
@@ -320,15 +358,33 @@ def register_tool(function, schema, display_name, retry_policy=None, idempotent=
         function=function,
         schema=schema,
         display_name=display_name,
+        output_model=output_model,
         retry_policy=retry_policy or RetryPolicy(),
         idempotent=idempotent,
     )
 
 
-register_tool(calculator, CALCULATOR_SCHEMA, "Calculator")
-register_tool(web_search, WEB_SEARCH_SCHEMA, "WebSearch", RetryPolicy(max_attempts=3))
-register_tool(read_webpage, READ_WEBPAGE_SCHEMA, "ReadWebpage", RetryPolicy(max_attempts=2))
-register_tool(get_current_time, GET_CURRENT_TIME_SCHEMA, "GetCurrentTime")
+register_tool(calculator, CALCULATOR_SCHEMA, CalculatorOutput, "Calculator")
+register_tool(
+    web_search,
+    WEB_SEARCH_SCHEMA,
+    WebSearchOutput,
+    "WebSearch",
+    RetryPolicy(max_attempts=3),
+)
+register_tool(
+    read_webpage,
+    READ_WEBPAGE_SCHEMA,
+    ReadWebpageOutput,
+    "ReadWebpage",
+    RetryPolicy(max_attempts=2),
+)
+register_tool(
+    get_current_time,
+    GET_CURRENT_TIME_SCHEMA,
+    CurrentTimeOutput,
+    "GetCurrentTime",
+)
 
 
 # 校验模型生成的工具参数是否符合 Schema
@@ -367,7 +423,20 @@ def validate_tool_arguments(schema, args):
 def get_tool_schemas(registry=None):
     # active_registry：用于生成 Schema 的实际工具注册表
     active_registry = TOOLS if registry is None else registry
-    return [tool.schema for tool in active_registry.values()]
+    # schemas：将输出说明合并进 description 后的模型工具定义
+    schemas = []
+
+    # tool：当前正在生成模型定义的已注册工具
+    for tool in active_registry.values():
+        # schema：避免修改注册表原始数据的工具 Schema 副本
+        schema = copy.deepcopy(tool.schema)
+
+        # output_description：展示给模型的工具返回值语义
+        output_description = tool.output_schema.get("description")
+        if output_description:
+            schema["function"]["description"] += f"\n返回值：{output_description}"
+        schemas.append(schema)
+    return schemas
 
 
 # 将工具调用格式化为 ReAct 日志中的 Action 文本
@@ -393,9 +462,17 @@ def format_tool_action(name, args, registry=None):
 # name：工具注册名称
 # args：以关键字参数形式传给工具函数的字典
 def execute_tool(name, args):
+    # tool：名称对应的已注册工具
     tool = TOOLS.get(name)
     if not tool:
         raise ValueError(f"未知工具：{name}")
+
     # 校验工具参数是否符合 Schema
     validate_tool_arguments(tool.schema, args)
-    return tool.function(**args)
+
+    # value：工具函数返回的原始业务数据
+    value = tool.function(**args)
+
+    # validated_output：经过 Pydantic 返回模型校验的业务结果
+    validated_output = tool.output_model.model_validate(value)
+    return validated_output.model_dump(mode="json")

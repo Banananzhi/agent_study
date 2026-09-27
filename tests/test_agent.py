@@ -95,6 +95,7 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(request_body["tool_choice"], "auto")
         self.assertEqual(len(request_body["tools"]), 4)
         self.assertNotIn("response_format", request_body)
+        self.assertTrue(all("返回值：" in item["function"]["description"] for item in request_body["tools"]))
 
     # 验证可恢复错误会使用 tool 消息返回模型修正
     def test_model_recoverable_error_returns_as_tool_message(self):

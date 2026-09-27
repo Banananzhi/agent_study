@@ -1,5 +1,7 @@
 import unittest
 
+from pydantic import ConfigDict, RootModel
+
 from tool_executor import ToolExecutor
 from tool_result import ErrorCode
 from tools import RetryPolicy, Tool, ToolAuthenticationError
@@ -19,16 +21,24 @@ SCHEMA = {
     },
 }
 
+class FakeOutput(RootModel):
+    """返回测试字符串。"""
+
+    model_config = ConfigDict(strict=True)
+    root: str
+
 
 # 创建带重试策略的测试工具
 # function：测试工具函数
 # max_attempts：最大执行次数
 # idempotent：是否允许重复执行
-def make_tool(function, max_attempts=3, idempotent=True):
+# output_model：测试工具成功返回值的 Pydantic 模型
+def make_tool(function, max_attempts=3, idempotent=True, output_model=None):
     return Tool(
         function=function,
         schema=SCHEMA,
         display_name="Fake",
+        output_model=output_model or FakeOutput,
         retry_policy=RetryPolicy(
             max_attempts=max_attempts,
             base_delay=0.5,
@@ -144,12 +154,43 @@ class ToolExecutorTests(unittest.TestCase):
                 },
             },
         }
-        tool = Tool(lambda value: called.append(value), schema, "Fake")
+        tool = Tool(
+            function=lambda value: called.append(value),
+            schema=schema,
+            display_name="Fake",
+            output_model=FakeOutput,
+        )
         result = ToolExecutor({"fake": tool}).execute("fake", {})
 
         self.assertEqual(result.error_code, ErrorCode.INVALID_ARGUMENTS)
         self.assertEqual(result.attempts, 0)
         self.assertEqual(called, [])
+
+    # 验证工具未报错但返回类型不符合约定时会被拦截
+    def test_invalid_output_is_rejected_without_retry(self):
+        # calls：记录工具函数的实际执行次数
+        calls = []
+
+        # invalid_output_tool：声明返回字符串却实际返回整数的测试工具
+        def invalid_output_tool():
+            calls.append(1)
+            return 123
+
+        # executor：配置了多次尝试但不应对输出契约错误重试的执行器
+        executor = ToolExecutor(
+            {"fake": make_tool(invalid_output_tool, max_attempts=3)},
+            sleeper=lambda delay: self.fail("错误输出不应等待重试"),
+        )
+
+        # result：工具业务返回值与 Output Schema 不一致时的统一失败结果
+        result = executor.execute("fake", {})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, ErrorCode.INVALID_OUTPUT)
+        self.assertEqual(result.attempts, 1)
+        self.assertFalse(result.auto_retryable)
+        self.assertFalse(result.model_recoverable)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

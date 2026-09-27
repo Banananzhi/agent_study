@@ -6,6 +6,7 @@ from enum import Enum
 class ErrorCode(str, Enum):
     UNKNOWN_TOOL = "unknown_tool"
     INVALID_ARGUMENTS = "invalid_arguments"
+    INVALID_OUTPUT = "invalid_output"
     REPEATED_ACTION = "repeated_action"
     TIMEOUT = "timeout"
     NETWORK_ERROR = "network_error"
@@ -19,6 +20,7 @@ class ErrorCode(str, Enum):
 ERROR_POLICIES = {
     ErrorCode.UNKNOWN_TOOL: (False, True),
     ErrorCode.INVALID_ARGUMENTS: (False, True),
+    ErrorCode.INVALID_OUTPUT: (False, False),
     ErrorCode.REPEATED_ACTION: (False, True),
     ErrorCode.TIMEOUT: (True, False),
     ErrorCode.NETWORK_ERROR: (True, False),

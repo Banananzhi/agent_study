@@ -9,7 +9,7 @@
 - `read_webpage`：读取公开网页正文
 - `get_current_time`：获取指定时区的当前时间
 
-每个工具都先定义标准 Function Tool Schema（名称、描述、参数类型、必填项、范围和额外参数策略），再通过 `register_tool()` 与实际 Python 函数绑定。Schema 会通过 DeepSeek API 的 `tools` 字段发送给模型，ToolExecutor 也会在执行前使用同一份 Schema 校验参数。
+每个工具都定义输入 Function Tool Schema 和 Pydantic 业务返回模型，再通过 `register_tool()` 与实际 Python 函数绑定。输入 Schema 会通过 DeepSeek API 的 `tools` 字段发送给模型；Pydantic 模型会自动生成 Output Schema，其语义说明会追加到工具 `description`。ToolExecutor 会在执行前校验输入参数，在执行后使用 `model_validate()` 校验业务返回值，再用 `model_dump(mode="json")` 规范化 `ToolResult.value`；不符合约定的返回值会转换为 `invalid_output` 失败。
 
 使用搜索前，需要在 `.env` 中设置博查 API Key：
 
