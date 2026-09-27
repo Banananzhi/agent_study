@@ -5,9 +5,10 @@ import urllib.error
 import urllib.request
 
 from config import load_env
+from result_summarizer import ResultSummarizer
 from tool_executor import ToolExecutor
 from tool_result import ErrorCode, ToolResult
-from tools import format_tool_action, get_tool_schemas
+from tools import ObservationPolicy, format_tool_action, get_tool_schemas
 
 
 load_env()
@@ -45,6 +46,7 @@ class Agent:
     # tool_executor：自定义工具执行器
     # max_model_recoveries：允许模型连续修正工具调用的最大轮数
     # max_observation_chars：单条 tool 消息允许的最大字符数
+    # result_summarizer：超长工具结果的公共摘要组件
     def __init__(
         self,
         model="deepseek-chat",
@@ -53,6 +55,7 @@ class Agent:
         tool_executor=None,
         max_model_recoveries=2,
         max_observation_chars=8000,
+        result_summarizer=None,
     ):
         if type(max_model_recoveries) is not int or max_model_recoveries < 0:
             raise ValueError("max_model_recoveries 必须是非负整数")
@@ -66,6 +69,11 @@ class Agent:
         self.tool_executor = tool_executor or ToolExecutor()
         self.max_model_recoveries = max_model_recoveries
         self.max_observation_chars = max_observation_chars
+        self.result_summarizer = result_summarizer or ResultSummarizer(
+            model=os.getenv("DEEPSEEK_SUMMARY_MODEL", self.model),
+            api_url=self.api_url,
+            api_key=self.api_key,
+        )
 
     # 调用大语言模型生成最终答案或原生工具调用
     # messages：发送给模型的上下文消息列表
@@ -192,6 +200,62 @@ class Agent:
         logger.info("🔧 正在执行工具: %s", tool_name)
         return self.tool_executor.execute(tool_name, arguments)
 
+    # 根据工具策略将完整结果转换为可返回模型的 Observation
+    # result：经过执行器和输出契约校验的工具结果
+    # goal：用户当前的任务目标
+    def build_observation(self, result, goal):
+        # full_observation：未经摘要或截断的完整 JSON Observation
+        full_observation = result.to_observation()
+        if len(full_observation) <= self.max_observation_chars:
+            return full_observation
+
+        # 错误结果必须保留稳定错误码和恢复语义，不交给模型改写
+        if not result.ok:
+            return result.to_observation(self.max_observation_chars)
+
+        # tool：当前工具在执行器注册表中的完整定义
+        tool = self.tool_executor.registry.get(result.tool)
+        # observation_policy：未知工具默认采用统一截断保护
+        observation_policy = (
+            tool.observation_policy
+            if tool is not None
+            else ObservationPolicy.TRUNCATE
+        )
+
+        if observation_policy == ObservationPolicy.SUMMARIZE:
+            try:
+                logger.info("📝 工具结果过长，正在生成摘要...")
+                # summary_limit：为 ToolResult 外层字段和摘要元数据预留的字符数
+                summary_limit = max(128, self.max_observation_chars // 2)
+                # summary：公共摘要组件基于完整工具业务值生成的压缩文本
+                summary = self.result_summarizer.summarize(
+                    tool_name=result.tool,
+                    value=result.value,
+                    goal=goal,
+                    max_chars=summary_limit,
+                )
+                # observation：保留工具执行元数据的摘要 Observation
+                observation = result.to_summarized_observation(
+                    summary,
+                    self.max_observation_chars,
+                    len(full_observation),
+                )
+                logger.info("✅ 工具结果摘要生成成功")
+                return observation
+            except Exception as error:
+                logger.warning("⚠️ 工具结果摘要失败，回退到统一截断：%s", error)
+                return result.to_observation(self.max_observation_chars)
+
+        if observation_policy == ObservationPolicy.RAW:
+            raise RuntimeError(
+                f"工具 {result.tool} 配置为 raw，但完整 Observation "
+                f"长度 {len(full_observation)} 超过上限 {self.max_observation_chars}"
+            )
+
+        if observation_policy == ObservationPolicy.PAGINATE:
+            logger.warning("⚠️ 分页工具返回值仍然超限，回退到统一截断")
+        return result.to_observation(self.max_observation_chars)
+
     # 执行完整的原生 Function Calling Agent 循环
     # goal：用户希望 Agent 完成的任务描述
     def run(self, goal):
@@ -283,8 +347,8 @@ class Agent:
                 if result.ok:
                     last_successful_signature = action_signature
 
-                # observation：已按统一上限安全截断的 JSON 工具结果
-                observation = result.to_observation(self.max_observation_chars)
+                # observation：按工具策略完整保留、摘要、分页或截断后的 JSON 工具结果
+                observation = self.build_observation(result, goal)
                 logger.info("👀 观察: %s", observation)
 
                 if not result.ok:

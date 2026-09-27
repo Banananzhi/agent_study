@@ -8,8 +8,15 @@
 - `web_search`：通过博查搜索实时网页信息
 - `read_webpage`：读取公开网页正文
 - `get_current_time`：获取指定时区的当前时间
+- `create_file`：在项目工作区内创建新文件，拒绝覆盖已有文件
+- `write_file`：使用字符偏移覆盖首段或追加写入后续分段
+- `read_file`：使用字符偏移分页读取工作区内的 UTF-8 文本文件
 
 每个工具都定义输入 Function Tool Schema 和 Pydantic 业务返回模型，再通过 `register_tool()` 与实际 Python 函数绑定。输入 Schema 会通过 DeepSeek API 的 `tools` 字段发送给模型；Pydantic 模型会自动生成 Output Schema，其语义说明会追加到工具 `description`。ToolExecutor 会在执行前校验输入参数，在执行后使用 `model_validate()` 校验业务返回值，再用 `model_dump(mode="json")` 规范化 `ToolResult.value`；不符合约定的返回值会转换为 `invalid_output` 失败。
+
+文件分页使用 Unicode 字符下标。`read_file()` 在 `has_more=true` 时返回下一页的 `next_offset`；`create_file()` 和 `write_file()` 同样返回下一段写入位置。`write_file(offset=0)` 覆盖首段，后续调用只能使用当前文件长度作为 `offset` 追加，偏移不匹配时拒绝写入，避免分段乱序或产生内容空洞。
+
+工具通过 `observation_policy` 声明长结果处理策略：`web_search` 和 `read_webpage` 使用 `summarize`，`read_file` 使用 `paginate`，短结构化工具使用 `raw`。公共 `ResultSummarizer` 会先按块摘要完整业务结果，再汇总各块摘要；摘要请求不携带工具权限。摘要服务失败时回退到统一截断，错误类 ToolResult 始终保留原有错误码和恢复字段，不交给模型改写。
 
 使用搜索前，需要在 `.env` 中设置博查 API Key：
 

@@ -197,6 +197,63 @@ class ToolResult:
             raise ValueError("max_chars 太小，无法容纳最小 Observation 结构")
         return observation
 
+    # 将模型生成的工具结果摘要序列化为受限 Observation
+    # summary：基于完整工具业务结果生成的摘要文本
+    # max_chars：摘要 Observation 允许的最大字符数
+    # original_observation_chars：未摘要 Observation 的原始字符数
+    def to_summarized_observation(self, summary, max_chars, original_observation_chars):
+        if not isinstance(summary, str) or not summary.strip():
+            raise ValueError("summary 必须是非空字符串")
+        if type(max_chars) is not int or max_chars < 512:
+            raise ValueError("max_chars 必须是大于等于 512 的整数")
+        if type(original_observation_chars) is not int or original_observation_chars < 1:
+            raise ValueError("original_observation_chars 必须是正整数")
+
+        # clean_summary：去除首尾空白后准备返回模型的摘要
+        clean_summary = summary.strip()
+        # payload：保留工具执行元数据并以摘要替换超长 value 的结果
+        payload = self.to_dict()
+        payload["value"] = clean_summary
+        payload["summarization"] = {
+            "summarized": True,
+            "original_observation_chars": original_observation_chars,
+            "summary_chars": len(clean_summary),
+        }
+
+        # observation：尚未对摘要文本进行二次长度保护的 JSON Observation
+        observation = self._serialize_observation(payload)
+        if len(observation) <= max_chars:
+            return observation
+
+        # low：二分查找中可保留摘要字符数的下界
+        low = 0
+        # high：二分查找中可保留摘要字符数的上界
+        high = len(clean_summary)
+        # best_observation：当前找到的最长且不超限摘要 Observation
+        best_observation = None
+        while low <= high:
+            # kept_chars：本次尝试保留的摘要字符数
+            kept_chars = (low + high) // 2
+            # fitted_summary：必要时添加省略标记的受限摘要
+            fitted_summary = (
+                clean_summary
+                if kept_chars == len(clean_summary)
+                else clean_summary[:kept_chars] + "…"
+            )
+            payload["value"] = fitted_summary
+            payload["summarization"]["summary_chars"] = len(fitted_summary)
+            # candidate：本次尝试的完整摘要 Observation
+            candidate = self._serialize_observation(payload)
+            if len(candidate) <= max_chars:
+                best_observation = candidate
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+
+        if best_observation is not None:
+            return best_observation
+        return self.to_observation(max_chars)
+
     # 序列化为可直接返模型的 JSON Observation
     # max_chars：最大字符数，为空时不限制长度
     def to_observation(self, max_chars=None):

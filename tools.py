@@ -9,7 +9,9 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as fixed_timezone
+from enum import Enum
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -18,6 +20,8 @@ from pydantic import BaseModel
 from tool_models import (
     CalculatorOutput,
     CurrentTimeOutput,
+    FileOperationOutput,
+    ReadFileOutput,
     ReadWebpageOutput,
     WebSearchOutput,
 )
@@ -33,12 +37,26 @@ OPS = {
 }
 
 
+# WORKSPACE_ROOT：允许文件工具读写的项目根目录
+WORKSPACE_ROOT = Path(__file__).resolve().parent
+
+# READ_FILE_CONTENT_JSON_BUDGET：在 8000 字符 Observation 中为文件内容预留的 JSON 长度
+READ_FILE_CONTENT_JSON_BUDGET = 6000
+
+
 class UnsafeRequestError(ValueError):
     pass
 
 
 class ToolAuthenticationError(RuntimeError):
     pass
+
+
+class ObservationPolicy(str, Enum):
+    SUMMARIZE = "summarize"
+    PAGINATE = "paginate"
+    TRUNCATE = "truncate"
+    RAW = "raw"
 
 
 # 安全计算基础算术表达式
@@ -189,6 +207,139 @@ def get_current_time(timezone="Asia/Shanghai"):
     return datetime.now(zone).replace(microsecond=0)
 
 
+# 将模型提供的相对路径解析为工作区内的安全路径
+# path：相对于项目根目录的文件路径
+def _resolve_workspace_path(path):
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("文件路径不能为空")
+
+    # requested_path：模型提供的原始相对路径
+    requested_path = Path(path)
+    if requested_path.is_absolute():
+        raise UnsafeRequestError("不允许使用绝对路径")
+
+    # workspace_root：解析过符号链接的工作区根目录
+    workspace_root = WORKSPACE_ROOT.resolve()
+    # target_path：解析过 .. 和符号链接的最终目标路径
+    target_path = (workspace_root / requested_path).resolve(strict=False)
+    try:
+        # relative_path：用于返回给模型的规范化工作区相对路径
+        relative_path = target_path.relative_to(workspace_root)
+    except ValueError as error:
+        raise UnsafeRequestError("文件路径不能越出工作区") from error
+    if relative_path == Path("."):
+        raise ValueError("文件路径不能指向工作区根目录")
+    return target_path, relative_path.as_posix()
+
+
+# 在工作区内创建 UTF-8 文件，已存在时拒绝覆盖
+# path：相对于项目根目录的文件路径
+# content：创建文件时写入的完整文本
+def create_file(path, content=""):
+    # target_path：通过工作区边界校验的文件路径
+    target_path, relative_path = _resolve_workspace_path(path)
+    if target_path.exists():
+        raise ValueError(f"文件已存在：{relative_path}")
+
+    # 自动创建工作区内缺失的父目录
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # chars_written：成功写入新文件的 Unicode 字符数
+        with target_path.open("x", encoding="utf-8", newline="") as file:
+            chars_written = file.write(content)
+    except FileExistsError as error:
+        raise ValueError(f"文件已存在：{relative_path}") from error
+    return {
+        "path": relative_path,
+        "chars_written": chars_written,
+        "next_offset": chars_written,
+    }
+
+
+# 按字符偏移覆盖首段或追加写入工作区内已存在的 UTF-8 文件
+# path：相对于项目根目录的文件路径
+# content：本次要写入的文本分段
+# offset：本次写入的起始字符偏移，0 表示覆盖首段
+def write_file(path, content, offset=0):
+    # target_path：通过工作区边界校验的文件路径
+    target_path, relative_path = _resolve_workspace_path(path)
+    if not target_path.exists():
+        raise ValueError(f"文件不存在：{relative_path}")
+    if not target_path.is_file():
+        raise ValueError(f"目标不是普通文件：{relative_path}")
+
+    if offset == 0:
+        # chars_written：成功覆盖写入首段的 Unicode 字符数
+        chars_written = target_path.write_text(content, encoding="utf-8", newline="")
+    else:
+        # current_length：追加前文件已有的 Unicode 字符数
+        with target_path.open("r", encoding="utf-8", newline="") as file:
+            current_length = sum(len(chunk) for chunk in iter(lambda: file.read(8192), ""))
+        if offset != current_length:
+            raise ValueError(
+                f"写入偏移不匹配：期望 {current_length}，实际传入 {offset}"
+            )
+
+        # chars_written：成功追加写入后续分段的 Unicode 字符数
+        with target_path.open("a", encoding="utf-8", newline="") as file:
+            chars_written = file.write(content)
+    return {
+        "path": relative_path,
+        "chars_written": chars_written,
+        "next_offset": offset + chars_written,
+    }
+
+
+# 读取工作区内已存在的 UTF-8 文件内容
+# path：相对于项目根目录的文件路径
+# offset：本次读取的起始字符偏移
+# max_chars：每页最多返回的文件字符数
+def read_file(path, offset=0, max_chars=6000):
+    # target_path：通过工作区边界校验的文件路径
+    target_path, relative_path = _resolve_workspace_path(path)
+    if not target_path.exists():
+        raise ValueError(f"文件不存在：{relative_path}")
+    if not target_path.is_file():
+        raise ValueError(f"目标不是普通文件：{relative_path}")
+
+    # skipped_content：从文件开头跳过的已读取字符
+    with target_path.open("r", encoding="utf-8", newline="") as file:
+        skipped_content = file.read(offset)
+        if len(skipped_content) != offset:
+            raise ValueError(
+                f"读取偏移超出文件长度：文件长度 {len(skipped_content)}，实际传入 {offset}"
+            )
+
+        # raw_content：多读取一个字符，用于判断是否还有下一页
+        raw_content = file.read(max_chars + 1)
+
+    # candidate_content：尚未考虑 JSON 转义膨胀的本页候选内容
+    candidate_content = raw_content[:max_chars]
+    # content_parts：在 Observation 内容预算内可安全返回的字符片段
+    content_parts = []
+    # serialized_chars：当前文件内容经 JSON 转义后占用的字符数
+    serialized_chars = 0
+    for character in candidate_content:
+        # character_json_chars：当前字符经 JSON 转义后的实际长度
+        character_json_chars = len(json.dumps(character, ensure_ascii=False)) - 2
+        if serialized_chars + character_json_chars > READ_FILE_CONTENT_JSON_BUDGET:
+            break
+        content_parts.append(character)
+        serialized_chars += character_json_chars
+
+    # content：同时满足字符数和 Observation JSON 长度限制的本页内容
+    content = "".join(content_parts)
+    # has_more：文件在本页之后是否还有内容
+    has_more = len(raw_content) > len(content)
+    return {
+        "path": relative_path,
+        "offset": offset,
+        "next_offset": offset + len(content),
+        "has_more": has_more,
+        "content": content,
+    }
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     max_attempts: int = 1
@@ -214,6 +365,7 @@ class Tool:
     output_model: type[BaseModel]
     retry_policy: RetryPolicy = RetryPolicy()
     idempotent: bool = True
+    observation_policy: ObservationPolicy = ObservationPolicy.TRUNCATE
 
     # 校验工具的输入、输出 Schema 和显示名称
     def __post_init__(self):
@@ -228,6 +380,8 @@ class Tool:
             raise ValueError("工具 output_model 必须包含返回值说明")
         if not isinstance(self.display_name, str) or not self.display_name.strip():
             raise ValueError("工具 display_name 不能为空")
+        if not isinstance(self.observation_policy, ObservationPolicy):
+            raise ValueError("observation_policy 必须是 ObservationPolicy 枚举")
 
     # 获取工具在注册表中的标准名称
     @property
@@ -327,6 +481,107 @@ GET_CURRENT_TIME_SCHEMA = {
     },
 }
 
+CREATE_FILE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "create_file",
+        "description": "在项目工作区内创建 UTF-8 文件；不会覆盖已存在的文件。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "相对于项目根目录的文件路径，例如 output/report.md。",
+                    "minLength": 1,
+                    "maxLength": 500,
+                },
+                "content": {
+                    "type": "string",
+                    "description": "新文件的完整文本内容，省略时创建空文件。",
+                    "maxLength": 100000,
+                    "default": "",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+WRITE_FILE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "按字符偏移写入已存在的 UTF-8 文件。offset=0 覆盖写入首段；"
+            "后续分段必须使用上一次返回的 next_offset 追加。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "相对于项目根目录的已存在文件路径，例如 output/report.md。",
+                    "minLength": 1,
+                    "maxLength": 500,
+                },
+                "content": {
+                    "type": "string",
+                    "description": "本次要写入的文本分段。",
+                    "maxLength": 100000,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "本次写入的起始字符偏移；首段使用 0。",
+                    "minimum": 0,
+                    "default": 0,
+                },
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+READ_FILE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": (
+            "分页读取项目工作区内已存在的 UTF-8 文本文件。"
+            "has_more 为 true 时，使用 next_offset 继续读取下一页。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "相对于项目根目录的已存在文件路径，例如 output/report.md。",
+                    "minLength": 1,
+                    "maxLength": 500,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "本次读取的起始字符偏移；首页使用 0。",
+                    "minimum": 0,
+                    "default": 0,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": (
+                        "每页最多返回的原始字符数；JSON 转义后过长时实际返回数可能更少。"
+                    ),
+                    "minimum": 1,
+                    "maximum": 6000,
+                    "default": 6000,
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 TOOLS = {}
 
@@ -338,6 +593,7 @@ TOOLS = {}
 # display_name：ReAct 日志中的显示名称
 # retry_policy：工具重试策略
 # idempotent：工具能否安全地重复执行
+# observation_policy：工具长结果进入模型上下文前的处理策略
 def register_tool(
     function,
     schema,
@@ -345,6 +601,7 @@ def register_tool(
     display_name,
     retry_policy=None,
     idempotent=True,
+    observation_policy=ObservationPolicy.TRUNCATE,
 ):
     if schema.get("type") != "function" or not isinstance(schema.get("function"), dict):
         raise ValueError("工具 Schema 必须是标准 function 类型")
@@ -361,16 +618,24 @@ def register_tool(
         output_model=output_model,
         retry_policy=retry_policy or RetryPolicy(),
         idempotent=idempotent,
+        observation_policy=observation_policy,
     )
 
 
-register_tool(calculator, CALCULATOR_SCHEMA, CalculatorOutput, "Calculator")
+register_tool(
+    calculator,
+    CALCULATOR_SCHEMA,
+    CalculatorOutput,
+    "Calculator",
+    observation_policy=ObservationPolicy.RAW,
+)
 register_tool(
     web_search,
     WEB_SEARCH_SCHEMA,
     WebSearchOutput,
     "WebSearch",
     RetryPolicy(max_attempts=3),
+    observation_policy=ObservationPolicy.SUMMARIZE,
 )
 register_tool(
     read_webpage,
@@ -378,12 +643,37 @@ register_tool(
     ReadWebpageOutput,
     "ReadWebpage",
     RetryPolicy(max_attempts=2),
+    observation_policy=ObservationPolicy.SUMMARIZE,
 )
 register_tool(
     get_current_time,
     GET_CURRENT_TIME_SCHEMA,
     CurrentTimeOutput,
     "GetCurrentTime",
+    observation_policy=ObservationPolicy.RAW,
+)
+register_tool(
+    create_file,
+    CREATE_FILE_SCHEMA,
+    FileOperationOutput,
+    "CreateFile",
+    idempotent=False,
+    observation_policy=ObservationPolicy.RAW,
+)
+register_tool(
+    write_file,
+    WRITE_FILE_SCHEMA,
+    FileOperationOutput,
+    "WriteFile",
+    idempotent=False,
+    observation_policy=ObservationPolicy.RAW,
+)
+register_tool(
+    read_file,
+    READ_FILE_SCHEMA,
+    ReadFileOutput,
+    "ReadFile",
+    observation_policy=ObservationPolicy.PAGINATE,
 )
 
 
