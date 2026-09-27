@@ -291,6 +291,28 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(agent.run("执行多步任务"), "完成")
         self.assertEqual(len(executor.calls), 3)
 
+    # 验证 Agent 返回模型的 tool 消息不超过配置长度
+    def test_agent_limits_tool_message_length(self):
+        # executor：返回超长网页内容的测试执行器
+        executor = FakeExecutor([
+            ToolResult.success("read_webpage", "网页内容" * 3000),
+        ])
+        agent = ScriptedAgent(
+            [
+                tool_response("read_webpage", {"url": "https://example.com"}, "call_1"),
+                final_response("完成"),
+            ],
+            tool_executor=executor,
+            max_observation_chars=800,
+        )
+
+        self.assertEqual(agent.run("读取网页"), "完成")
+
+        # tool_message：第二轮模型调用前收到的受限工具消息
+        tool_message = agent.seen_messages[1][-1]
+        self.assertLessEqual(len(tool_message["content"]), 800)
+        self.assertTrue(json.loads(tool_message["content"])["truncation"]["truncated"])
+
 
 if __name__ == "__main__":
     unittest.main()

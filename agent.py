@@ -44,6 +44,7 @@ class Agent:
     # max_steps：单次任务允许执行的最大模型调用轮数
     # tool_executor：自定义工具执行器
     # max_model_recoveries：允许模型连续修正工具调用的最大轮数
+    # max_observation_chars：单条 tool 消息允许的最大字符数
     def __init__(
         self,
         model="deepseek-chat",
@@ -51,9 +52,12 @@ class Agent:
         max_steps=8,
         tool_executor=None,
         max_model_recoveries=2,
+        max_observation_chars=8000,
     ):
         if type(max_model_recoveries) is not int or max_model_recoveries < 0:
             raise ValueError("max_model_recoveries 必须是非负整数")
+        if type(max_observation_chars) is not int or max_observation_chars < 512:
+            raise ValueError("max_observation_chars 必须是大于等于 512 的整数")
         self.model = os.getenv("DEEPSEEK_MODEL", model)
         self.system = system or SYSTEM
         self.max_steps = max_steps
@@ -61,6 +65,7 @@ class Agent:
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         self.tool_executor = tool_executor or ToolExecutor()
         self.max_model_recoveries = max_model_recoveries
+        self.max_observation_chars = max_observation_chars
 
     # 调用大语言模型生成最终答案或原生工具调用
     # messages：发送给模型的上下文消息列表
@@ -277,7 +282,10 @@ class Agent:
                     )
                 if result.ok:
                     last_successful_signature = action_signature
-                logger.info("👀 观察: %s", result.to_observation())
+
+                # observation：已按统一上限安全截断的 JSON 工具结果
+                observation = result.to_observation(self.max_observation_chars)
+                logger.info("👀 观察: %s", observation)
 
                 if not result.ok:
                     if not result.model_recoverable:
@@ -289,7 +297,7 @@ class Agent:
                 tool_message = {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": result.to_observation(),
+                    "content": observation,
                 }
                 messages.append(tool_message)
 

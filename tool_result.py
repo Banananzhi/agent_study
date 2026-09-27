@@ -147,6 +147,139 @@ class ToolResult:
             result["error"]["suggestions"] = list(self.suggestions)
         return result
 
-    # 序列化为可直接返回模型的 JSON Observation
-    def to_observation(self):
-        return json.dumps(self.to_dict(), ensure_ascii=False, default=str)
+    # 将观察结果序列化为紧凑的 JSON 文本
+    # payload：待序列化的观察结果字典
+    @staticmethod
+    def _serialize_observation(payload):
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+
+    # 构造极端情况下仍能放入长度上限的最小观察结果
+    # max_chars：观察结果允许的最大字符数
+    # original_chars：未截断观察结果的字符数
+    def _minimal_observation(self, max_chars, original_chars):
+        # tool_name：为最小观察结果保留的有限长度工具名称
+        tool_name = self.tool[:64]
+
+        # payload：丢弃非必要长文本后的最小观察结果结构
+        payload = {
+            "ok": self.ok,
+            "tool": tool_name,
+            "attempts": self.attempts,
+            "duration_ms": self.duration_ms,
+            "truncation": {
+                "truncated": True,
+                "field": "observation",
+                "original_observation_chars": original_chars,
+                "returned_field_chars": 0,
+            },
+        }
+        if self.ok:
+            payload["value"] = ""
+        else:
+            payload["error"] = {
+                "code": self.error_code.value,
+                "message": "",
+                "auto_retryable": self.auto_retryable,
+                "model_recoverable": self.model_recoverable,
+                "retry_exhausted": self.retry_exhausted,
+            }
+
+        # observation：序列化后的最小观察结果
+        observation = self._serialize_observation(payload)
+        if len(observation) > max_chars:
+            raise ValueError("max_chars 太小，无法容纳最小 Observation 结构")
+        return observation
+
+    # 序列化为可直接返模型的 JSON Observation
+    # max_chars：最大字符数，为空时不限制长度
+    def to_observation(self, max_chars=None):
+        if max_chars is not None and (type(max_chars) is not int or max_chars < 512):
+            raise ValueError("max_chars 必须为空或大于等于 512 的整数")
+
+        # payload：即将返回模型的结构化观察结果
+        payload = self.to_dict()
+
+        # observation：未经截断的完整观察结果 JSON
+        observation = self._serialize_observation(payload)
+        if max_chars is None or len(observation) <= max_chars:
+            return observation
+
+        # original_observation_chars：完整观察结果的原始字符数
+        original_observation_chars = len(observation)
+
+        if self.ok:
+            # original_value：工具成功时返回的原始数据
+            original_value = payload["value"]
+
+            # source_text：用于安全截断的文本形式工具结果
+            source_text = (
+                original_value
+                if isinstance(original_value, str)
+                else self._serialize_observation(original_value)
+            )
+
+            # value_format：截断前工具结果的表达格式
+            value_format = "text" if isinstance(original_value, str) else "json_text"
+
+            # target：承载待截断字段的字典
+            target = payload
+
+            # field：待截断的成功结果字段名称
+            field = "value"
+        else:
+            # source_text：用于安全截断的工具错误说明
+            source_text = payload["error"]["message"]
+
+            # value_format：错误说明始终以普通文本表达
+            value_format = "text"
+
+            # target：承载待截断错误说明的字典
+            target = payload["error"]
+
+            # field：待截断的错误说明字段名称
+            field = "message"
+
+        # truncation：告知模型截断位置和原始长度的元数据
+        truncation = {
+            "truncated": True,
+            "field": field,
+            "format": value_format,
+            "original_observation_chars": original_observation_chars,
+            "original_field_chars": len(source_text),
+            "returned_field_chars": 0,
+        }
+        payload["truncation"] = truncation
+
+        # low：二分查找中当前可保留字符数的下界
+        low = 0
+
+        # high：二分查找中当前可保留字符数的上界
+        high = len(source_text)
+
+        # best_observation：当前找到的最长且不超限观察结果
+        best_observation = None
+        while low <= high:
+            # kept_chars：本次尝试保留的原始字段字符数
+            kept_chars = (low + high) // 2
+
+            # truncated_text：本次尝试放入 Observation 的截断文本
+            truncated_text = source_text[:kept_chars] + "…"
+            target[field] = truncated_text
+            truncation["returned_field_chars"] = len(truncated_text)
+
+            # candidate：本次尝试的完整 JSON Observation
+            candidate = self._serialize_observation(payload)
+            if len(candidate) <= max_chars:
+                best_observation = candidate
+                low = kept_chars + 1
+            else:
+                high = kept_chars - 1
+
+        if best_observation is None:
+            return self._minimal_observation(max_chars, original_observation_chars)
+        return best_observation
