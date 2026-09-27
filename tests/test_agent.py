@@ -6,19 +6,23 @@ from unittest.mock import patch
 
 from agent import Agent, AgentToolError
 from tool_result import ErrorCode, ToolResult
+from tools import TOOLS
 
 
 class FakeExecutor:
     # 初始化按顺序返回结果的测试执行器
     # results：每次 execute 调用应返回的结果
-    def __init__(self, results):
+    # registry：用于生成 Action 指纹的测试工具注册表
+    def __init__(self, results, registry=None):
         self.results = iter(results)
-        self.registry = {}
+        self.registry = {} if registry is None else registry
+        self.calls = []
 
     # 返回下一个预置工具结果
     # name：模型选择的工具名称
     # args：模型生成的工具参数
     def execute(self, name, args):
+        self.calls.append((name, args))
         return next(self.results)
 
 
@@ -224,6 +228,68 @@ class AgentFunctionCallingTests(unittest.TestCase):
             [item["tool_call_id"] for item in tool_messages],
             ["call_1", "call_2"],
         )
+
+    # 验证紧邻的相同成功 Action 不会再次进入 ToolExecutor
+    def test_consecutive_successful_action_is_blocked(self):
+        # executor：只预置一次成功结果的测试执行器
+        executor = FakeExecutor([ToolResult.success("calculator", 3)])
+        agent = ScriptedAgent(
+            [
+                tool_response("calculator", {"expression": "1+2"}, "call_1"),
+                tool_response("calculator", {"expression": "1+2"}, "call_2"),
+                final_response("使用已有结果：3"),
+            ],
+            tool_executor=executor,
+        )
+
+        self.assertEqual(agent.run("计算 1+2"), "使用已有结果：3")
+        self.assertEqual(len(executor.calls), 1)
+
+        # observation：第三轮模型调用前收到的重复 Action 错误
+        observation = json.loads(agent.seen_messages[2][-1]["content"])
+        self.assertEqual(observation["error"]["code"], "repeated_action")
+        self.assertTrue(observation["error"]["model_recoverable"])
+        self.assertEqual(observation["attempts"], 0)
+
+    # 验证 Schema 默认值会参与 Action 指纹的标准化
+    def test_action_signature_applies_schema_defaults(self):
+        # executor：使用真实工具 Schema 但返回模拟搜索结果的执行器
+        executor = FakeExecutor(
+            [ToolResult.success("web_search", "搜索结果")],
+            registry=TOOLS,
+        )
+        agent = ScriptedAgent(
+            [
+                tool_response("web_search", {"query": "华为手机"}, "call_1"),
+                tool_response("web_search", {"count": 5, "query": "华为手机"}, "call_2"),
+                final_response("使用首次搜索结果"),
+            ],
+            tool_executor=executor,
+        )
+
+        self.assertEqual(agent.run("搜索华为手机"), "使用首次搜索结果")
+        self.assertEqual(len(executor.calls), 1)
+
+    # 验证中间出现不同 Action 后，允许后续再次调用原 Action
+    def test_non_consecutive_same_action_is_allowed(self):
+        # executor：为三次非连续重复调用提供成功结果的执行器
+        executor = FakeExecutor([
+            ToolResult.success("calculator", 3),
+            ToolResult.success("get_current_time", "2026-09-27T12:00:00+08:00"),
+            ToolResult.success("calculator", 3),
+        ])
+        agent = ScriptedAgent(
+            [
+                tool_response("calculator", {"expression": "1+2"}, "call_1"),
+                tool_response("get_current_time", {}, "call_2"),
+                tool_response("calculator", {"expression": "1+2"}, "call_3"),
+                final_response("完成"),
+            ],
+            tool_executor=executor,
+        )
+
+        self.assertEqual(agent.run("执行多步任务"), "完成")
+        self.assertEqual(len(executor.calls), 3)
 
 
 if __name__ == "__main__":

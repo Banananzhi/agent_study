@@ -44,4 +44,6 @@ python main.py
 
 `agent.py` 包含 `Agent` 类及所有实现细节：`think` 返回 DeepSeek 原生 assistant 消息，`act` 解析并执行 `tool_calls`，`run` 负责完整循环。工具结果会通过包含 `tool_call_id` 的 `tool` 消息回传模型；模型不再返回 `tool_calls` 时，其 `content` 就是最终答案。`main.py` 只负责创建 Agent 和调用 `run`。
 
+Agent 会使用“工具名称 + 按 Schema 补齐默认值后的标准参数”生成 Action 指纹。如果上一个 Action 已经成功，模型又立即生成完全相同的调用，Agent 会拦截重复执行并通过 `repeated_action` Observation 要求模型使用已有结果或调整调用。
+
 默认中文系统提示词定义在 `agent.py` 的 `SYSTEM` 常量中，也可以通过 `Agent(system="...")` 覆盖。
