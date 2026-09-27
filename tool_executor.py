@@ -1,0 +1,164 @@
+import difflib
+import logging
+import random
+import socket
+import time
+import urllib.error
+
+from tool_result import ERROR_POLICIES, ErrorCode, ToolResult
+from tools import TOOLS, ToolAuthenticationError, UnsafeRequestError, validate_tool_arguments
+
+
+logger = logging.getLogger(__name__)
+
+
+class ToolExecutor:
+    # 初始化工具执行器
+    # registry：工具注册表，默认使用全局 TOOLS
+    # sleeper：等待函数，测试时可注入替代实现
+    # jitter_fn：随机抖动函数，测试时可注入替代实现
+    def __init__(self, registry=None, sleeper=None, jitter_fn=None):
+        self.registry = TOOLS if registry is None else registry
+        self.sleeper = sleeper or time.sleep
+        self.jitter_fn = jitter_fn or random.uniform
+
+    # 查找与未知名称最接近的少量工具
+    # name：模型生成的工具名称
+    # limit：最多返回的建议数量
+    def _suggest_tools(self, name, limit=3):
+        return difflib.get_close_matches(name, self.registry.keys(), n=limit, cutoff=0.3)
+
+    # 校验参数、执行工具并按策略自动重试
+    # name：工具注册名称
+    # args：模型生成的工具参数
+    def execute(self, name, args):
+        started_at = time.perf_counter()
+
+        # 1. 从注册表查找工具，名称错误时直接返回相近工具建议
+        tool = self.registry.get(name)
+        if not tool:
+            return ToolResult.failure(
+                name,
+                ErrorCode.UNKNOWN_TOOL,
+                f"未知工具：{name}",
+                duration_ms=self._elapsed_ms(started_at),
+                suggestions=self._suggest_tools(name),
+            )
+
+        # 2. 根据 Tool Schema 校验参数，校验失败时不执行工具
+        try:
+            validate_tool_arguments(tool.schema, args)
+        except (ValueError, SyntaxError, ArithmeticError) as error:
+            return ToolResult.failure(
+                name,
+                ErrorCode.INVALID_ARGUMENTS,
+                str(error),
+                duration_ms=self._elapsed_ms(started_at),
+            )
+
+        # 3. 按工具自己的 RetryPolicy 进入有限次数执行循环
+        policy = tool.retry_policy
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                # 4. 使用模型生成的参数执行真正的工具函数
+                value = tool.function(**args)
+                if attempt > 1:
+                    logger.info("✅ 工具第 %d 次执行成功", attempt)
+                return ToolResult.success(
+                    name,
+                    value,
+                    duration_ms=self._elapsed_ms(started_at),
+                    attempts=attempt,
+                )
+            except UnsafeRequestError as error:
+                # 5. 安全拦截属于不可重试错误，立即返回
+                return ToolResult.failure(
+                    name,
+                    ErrorCode.UNSAFE_REQUEST,
+                    str(error),
+                    duration_ms=self._elapsed_ms(started_at),
+                    attempts=attempt,
+                )
+            except (ValueError, SyntaxError, ArithmeticError) as error:
+                # 6. 工具发现参数语义错误时交给模型修正，不重复执行
+                return ToolResult.failure(
+                    name,
+                    ErrorCode.INVALID_ARGUMENTS,
+                    str(error),
+                    duration_ms=self._elapsed_ms(started_at),
+                    attempts=attempt,
+                )
+            except Exception as error:
+                # 7. 将网络、超时、限流等基础设施异常转换为稳定错误码
+                error_code, message = self._classify_exception(error)
+                result = ToolResult.failure(
+                    name,
+                    error_code,
+                    message,
+                    duration_ms=self._elapsed_ms(started_at),
+                    attempts=attempt,
+                    retry_exhausted=(
+                        ERROR_POLICIES[error_code][0]
+                        and (not tool.idempotent or attempt >= policy.max_attempts)
+                    ),
+                )
+
+                # 8. 只有可自动重试、幂等且仍有次数的工具才允许再次执行
+                can_retry = (
+                    result.auto_retryable
+                    and tool.idempotent
+                    and attempt < policy.max_attempts
+                )
+                if not can_retry:
+                    return result
+
+                # 9. 按指数退避和随机抖动计算等待时间，避免连续冲击服务
+                delay = self._retry_delay(policy, attempt)
+                logger.warning(
+                    "⚠️ 工具第 %d 次执行失败：%s，%.2f 秒后重试",
+                    attempt,
+                    error_code.value,
+                    delay,
+                )
+                self.sleeper(delay)
+
+        raise RuntimeError("工具执行器进入了不可达状态")
+
+    # 将基础设施异常转换为稳定的错误码和安全说明
+    # error：工具执行时抛出的原始异常
+    @staticmethod
+    def _classify_exception(error):
+        # 按从具体到通用的顺序匹配，避免父类提前吞掉子类异常
+        if isinstance(error, ToolAuthenticationError):
+            return ErrorCode.AUTHENTICATION_ERROR, str(error)
+        if isinstance(error, urllib.error.HTTPError):
+            if error.code in {401, 403}:
+                return ErrorCode.AUTHENTICATION_ERROR, f"工具服务认证失败，HTTP {error.code}"
+            if error.code == 429:
+                return ErrorCode.RATE_LIMITED, "工具服务请求过于频繁，HTTP 429"
+            if 500 <= error.code <= 599:
+                return ErrorCode.SERVER_ERROR, f"工具服务暂时不可用，HTTP {error.code}"
+            return ErrorCode.INTERNAL_ERROR, f"工具服务返回未处理的 HTTP {error.code}"
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return ErrorCode.TIMEOUT, "工具请求超时"
+        if isinstance(error, urllib.error.URLError):
+            if isinstance(error.reason, (TimeoutError, socket.timeout)):
+                return ErrorCode.TIMEOUT, "工具请求超时"
+            return ErrorCode.NETWORK_ERROR, "工具网络连接失败"
+        if isinstance(error, (socket.gaierror, ConnectionError)):
+            return ErrorCode.NETWORK_ERROR, "工具网络连接失败"
+        return ErrorCode.INTERNAL_ERROR, "工具执行过程中发生内部错误"
+
+    # 计算指数退避和随机抖动后的等待时间
+    # policy：工具重试策略
+    # attempt：刚刚失败的执行次数
+    def _retry_delay(self, policy, attempt):
+        # 指数增长的等待时间不能超过工具配置的最大值
+        exponential = min(policy.base_delay * 2 ** (attempt - 1), policy.max_delay)
+        return exponential + self.jitter_fn(0, policy.jitter)
+
+    # 计算工具执行总耗时
+    # started_at：time.perf_counter 返回的开始时间
+    @staticmethod
+    def _elapsed_ms(started_at):
+        return round((time.perf_counter() - started_at) * 1000)
