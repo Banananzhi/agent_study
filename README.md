@@ -18,6 +18,8 @@
 
 工具通过 `observation_policy` 声明长结果处理策略：`web_search` 和 `read_webpage` 使用 `summarize`，`read_file` 使用 `paginate`，短结构化工具使用 `raw`。公共 `ResultSummarizer` 会先按块摘要完整业务结果，再汇总各块摘要；摘要请求不携带工具权限。摘要服务失败时回退到统一截断，错误类 ToolResult 始终保留原有错误码和恢复字段，不交给模型改写。
 
+同一轮的多个原生 `tool_calls` 由 `ToolBatchExecutor` 使用线程池动态调度，默认最大并行数为 4，可通过 `Agent(max_parallel_tools=...)` 调整。调度器只将已经一次性获得全部资源 Lease 的调用提交 Worker，等待锁的调用保留在调度队列中，不占用线程；后续无冲突调用可以先执行，但同资源冲突调用始终保持模型生成时的顺序。`read_file` 申请文件 READ 资源，`create_file` 和 `write_file` 申请 WRITE 资源，因此同文件读读可以并行、读写和写写互斥、不同文件可以并行。最终 ToolResult 与 tool message 始终按原始 `tool_calls` 顺序返回。
+
 使用搜索前，需要在 `.env` 中设置博查 API Key：
 
 ```dotenv

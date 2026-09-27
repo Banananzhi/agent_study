@@ -4,9 +4,12 @@ import random
 import socket
 import time
 import urllib.error
+import uuid
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from resource_lock import DEFAULT_RESOURCE_LOCK_MANAGER, ResourceLease
 from tool_result import ERROR_POLICIES, ErrorCode, ToolResult
 from tools import (
     TOOLS,
@@ -19,15 +22,25 @@ from tools import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PreparedToolExecution:
+    name: str
+    args: dict
+    tool: object
+    resources: tuple
+
+
 class ToolExecutor:
     # 初始化工具执行器
     # registry：工具注册表，默认使用全局 TOOLS
     # sleeper：等待函数，测试时可注入替代实现
     # jitter_fn：随机抖动函数，测试时可注入替代实现
-    def __init__(self, registry=None, sleeper=None, jitter_fn=None):
+    # lock_manager：为单独和批量工具执行提供共享资源租约的锁管理器
+    def __init__(self, registry=None, sleeper=None, jitter_fn=None, lock_manager=None):
         self.registry = TOOLS if registry is None else registry
         self.sleeper = sleeper or time.sleep
         self.jitter_fn = jitter_fn or random.uniform
+        self.lock_manager = lock_manager or DEFAULT_RESOURCE_LOCK_MANAGER
 
     # 查找与未知名称最接近的少量工具
     # name：模型生成的工具名称
@@ -35,10 +48,10 @@ class ToolExecutor:
     def _suggest_tools(self, name, limit=3):
         return difflib.get_close_matches(name, self.registry.keys(), n=limit, cutoff=0.3)
 
-    # 校验参数、执行工具并按策略自动重试
+    # 查找工具、校验参数并解析本次调用需要的资源
     # name：工具注册名称
     # args：模型生成的工具参数
-    def execute(self, name, args):
+    def prepare(self, name, args):
         started_at = time.perf_counter()
 
         # 1. 从注册表查找工具，名称错误时直接返回相近工具建议
@@ -63,7 +76,71 @@ class ToolExecutor:
                 duration_ms=self._elapsed_ms(started_at),
             )
 
-        # 3. 按工具自己的 RetryPolicy 进入有限次数执行循环
+        # 3. 根据工具参数解析读、写或独占资源，供批量调度和执行锁保护
+        try:
+            # resources：工具本次调用需要一次性获取的资源声明
+            resources = tool.resolve_resources(args)
+        except UnsafeRequestError as error:
+            return ToolResult.failure(
+                name,
+                ErrorCode.UNSAFE_REQUEST,
+                str(error),
+                duration_ms=self._elapsed_ms(started_at),
+            )
+        except (ValueError, SyntaxError, ArithmeticError) as error:
+            return ToolResult.failure(
+                name,
+                ErrorCode.INVALID_ARGUMENTS,
+                str(error),
+                duration_ms=self._elapsed_ms(started_at),
+            )
+
+        return PreparedToolExecution(name, args, tool, resources)
+
+    # 准备并执行单个工具调用，保留原有公开入口
+    # name：工具注册名称
+    # args：模型生成的工具参数
+    def execute(self, name, args):
+        # prepared：工具预处理结果或无需执行的失败 ToolResult
+        prepared = self.prepare(name, args)
+        if isinstance(prepared, ToolResult):
+            return prepared
+        return self.execute_prepared(prepared)
+
+    # 在资源租约保护下执行已完成预处理的工具调用
+    # prepared：已通过工具查找、参数校验和资源解析的执行对象
+    # resource_lease：批量调度器预先获得的资源租约
+    def execute_prepared(self, prepared, resource_lease=None):
+        if not isinstance(prepared, PreparedToolExecution):
+            raise TypeError("prepared 必须是 PreparedToolExecution")
+        if resource_lease is not None and not isinstance(resource_lease, ResourceLease):
+            raise TypeError("resource_lease 必须为空或 ResourceLease")
+        if resource_lease is not None:
+            if resource_lease.manager is not self.lock_manager:
+                raise ValueError("resource_lease 不属于当前 ToolExecutor 的锁管理器")
+            if resource_lease.accesses != prepared.resources:
+                raise ValueError("resource_lease 与 prepared.resources 不匹配")
+
+        # lease：批量调度器传入或单独执行时阻塞获取的资源租约
+        lease = resource_lease or self.lock_manager.acquire(
+            f"direct:{uuid.uuid4().hex}",
+            prepared.resources,
+        )
+        with lease:
+            return self._execute_with_retry(prepared)
+
+    # 执行已持有全部资源的工具，并按策略自动重试
+    # prepared：已完成预处理且资源受保护的工具执行对象
+    def _execute_with_retry(self, prepared):
+        # name：当前已准备工具的注册名称
+        name = prepared.name
+        # args：当前已通过 Schema 校验的工具参数
+        args = prepared.args
+        # tool：当前已准备工具的注册定义
+        tool = prepared.tool
+        started_at = time.perf_counter()
+
+        # 4. 按工具自己的 RetryPolicy 进入有限次数执行循环
         policy = tool.retry_policy
         for attempt in range(1, policy.max_attempts + 1):
             try:

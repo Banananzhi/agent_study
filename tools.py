@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
 
+from resource_lock import AccessMode, ResourceAccess
 from tool_models import (
     CalculatorOutput,
     CurrentTimeOutput,
@@ -232,6 +233,29 @@ def _resolve_workspace_path(path):
     return target_path, relative_path.as_posix()
 
 
+# 生成文件工具调用的规范化资源访问声明
+# args：已通过工具输入 Schema 校验的参数字典
+# mode：本次调用对目标文件的读写模式
+def _file_resources(args, mode):
+    # target_path：经过工作区边界和符号链接校验的目标路径
+    target_path, _ = _resolve_workspace_path(args["path"])
+    # resource_key：用于跨工具判断同一文件的大小写规范化绝对路径
+    resource_key = os.path.normcase(os.path.normpath(str(target_path)))
+    return (ResourceAccess("file", resource_key, mode),)
+
+
+# 解析文件只读工具本次需要的资源
+# args：已通过输入 Schema 校验的工具参数
+def file_read_resources(args):
+    return _file_resources(args, AccessMode.READ)
+
+
+# 解析文件写入工具本次需要的独占资源
+# args：已通过输入 Schema 校验的工具参数
+def file_write_resources(args):
+    return _file_resources(args, AccessMode.WRITE)
+
+
 # 在工作区内创建 UTF-8 文件，已存在时拒绝覆盖
 # path：相对于项目根目录的文件路径
 # content：创建文件时写入的完整文本
@@ -366,6 +390,7 @@ class Tool:
     retry_policy: RetryPolicy = RetryPolicy()
     idempotent: bool = True
     observation_policy: ObservationPolicy = ObservationPolicy.TRUNCATE
+    resource_resolver: Callable[[dict], tuple] | None = None
 
     # 校验工具的输入、输出 Schema 和显示名称
     def __post_init__(self):
@@ -382,6 +407,8 @@ class Tool:
             raise ValueError("工具 display_name 不能为空")
         if not isinstance(self.observation_policy, ObservationPolicy):
             raise ValueError("observation_policy 必须是 ObservationPolicy 枚举")
+        if self.resource_resolver is not None and not callable(self.resource_resolver):
+            raise ValueError("resource_resolver 必须为空或可调用对象")
 
     # 获取工具在注册表中的标准名称
     @property
@@ -392,6 +419,17 @@ class Tool:
     @property
     def output_schema(self):
         return self.output_model.model_json_schema()
+
+    # 根据已校验参数解析本次调用需要的全部资源
+    # args：已通过输入 Schema 校验的工具参数
+    def resolve_resources(self, args):
+        if self.resource_resolver is None:
+            return ()
+        # resources：资源解析器为本次调用返回的资源声明
+        resources = tuple(self.resource_resolver(args))
+        if not all(isinstance(resource, ResourceAccess) for resource in resources):
+            raise TypeError("resource_resolver 必须返回 ResourceAccess 序列")
+        return resources
 
 
 CALCULATOR_SCHEMA = {
@@ -594,6 +632,7 @@ TOOLS = {}
 # retry_policy：工具重试策略
 # idempotent：工具能否安全地重复执行
 # observation_policy：工具长结果进入模型上下文前的处理策略
+# resource_resolver：根据已校验参数生成资源访问声明的函数
 def register_tool(
     function,
     schema,
@@ -602,6 +641,7 @@ def register_tool(
     retry_policy=None,
     idempotent=True,
     observation_policy=ObservationPolicy.TRUNCATE,
+    resource_resolver=None,
 ):
     if schema.get("type") != "function" or not isinstance(schema.get("function"), dict):
         raise ValueError("工具 Schema 必须是标准 function 类型")
@@ -619,6 +659,7 @@ def register_tool(
         retry_policy=retry_policy or RetryPolicy(),
         idempotent=idempotent,
         observation_policy=observation_policy,
+        resource_resolver=resource_resolver,
     )
 
 
@@ -659,6 +700,7 @@ register_tool(
     "CreateFile",
     idempotent=False,
     observation_policy=ObservationPolicy.RAW,
+    resource_resolver=file_write_resources,
 )
 register_tool(
     write_file,
@@ -667,6 +709,7 @@ register_tool(
     "WriteFile",
     idempotent=False,
     observation_policy=ObservationPolicy.RAW,
+    resource_resolver=file_write_resources,
 )
 register_tool(
     read_file,
@@ -674,6 +717,7 @@ register_tool(
     ReadFileOutput,
     "ReadFile",
     observation_policy=ObservationPolicy.PAGINATE,
+    resource_resolver=file_read_resources,
 )
 
 
