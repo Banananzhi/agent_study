@@ -266,14 +266,14 @@ class Agent:
 
     # 解析一轮原生工具调用并在执行前拦截连续或批次内重复 Action
     # tool_calls：模型本轮返回的原生工具调用列表
-    # last_successful_signature：上一个连续成功 Action 的标准指纹
-    def prepare_tool_batch(self, tool_calls, last_successful_signature):
+    # last_successful_signatures：上一批需要拦截立即重复的 Action 指纹集合
+    def prepare_tool_batch(self, tool_calls, last_successful_signatures):
         # batch_calls：保持 assistant.tool_calls 原始顺序的批量调度对象
         batch_calls = []
         # seen_signatures：本批已出现过的标准 Action 指纹
         seen_signatures = set()
-        # previous_signature：仅用于检查批次开头是否紧邻重复上一个成功 Action
-        previous_signature = last_successful_signature
+        # previous_signatures：固定上一批所有成功或已拦截 Action 的指纹集合
+        previous_signatures = set(last_successful_signatures)
 
         # index：当前工具调用在 assistant.tool_calls 中的原始下标
         # tool_call：本轮正在预处理的原生工具调用
@@ -299,7 +299,7 @@ class Agent:
                 )
                 action_signature = self.create_action_signature(tool_name, arguments)
                 if (
-                    action_signature == previous_signature
+                    action_signature in previous_signatures
                     or action_signature in seen_signatures
                 ):
                     logger.warning("♻️ 拦截重复的工具调用")
@@ -311,9 +311,6 @@ class Agent:
                     )
                 else:
                     seen_signatures.add(action_signature)
-                previous_signature = None
-            else:
-                previous_signature = None
 
             batch_calls.append(
                 BatchToolCall(
@@ -336,8 +333,8 @@ class Agent:
         # consecutive_recoveries：模型连续修正错误工具调用的轮数
         consecutive_recoveries = 0
 
-        # last_successful_signature：可用于拦截立即重复调用的上一个成功 Action 指纹
-        last_successful_signature = None
+        # last_successful_signatures：用于拦截下一批立即重复调用的 Action 指纹集合
+        last_successful_signatures = set()
 
         # step：当前模型决策轮数
         for step in range(1, self.max_steps + 1):
@@ -370,9 +367,11 @@ class Agent:
             last_recoverable_result = None
 
             # batch_calls：完成协议解析和重复 Action 拦截的有序批量调用
-            batch_calls = self.prepare_tool_batch(tool_calls, last_successful_signature)
+            batch_calls = self.prepare_tool_batch(tool_calls, last_successful_signatures)
             # batch_results：经资源调度和线程池执行后按原始下标排列的结果
             batch_results = self.tool_batch_executor.execute_batch(batch_calls)
+            # next_successful_signatures：下一轮需要防止立即重复的本批 Action 指纹
+            next_successful_signatures = set()
 
             # batch_call：当前正在处理结果的批量调用
             # result：当前批量调用对应的 ToolResult
@@ -388,10 +387,10 @@ class Agent:
                         f"实际返回 {type(result).__name__}"
                     )
                 if result.ok:
-                    last_successful_signature = action_signature
-                elif result.error_code != ErrorCode.REPEATED_ACTION:
-                    # 非重复调用失败会打断上一个成功 Action 的连续关系
-                    last_successful_signature = None
+                    next_successful_signatures.add(action_signature)
+                elif result.error_code == ErrorCode.REPEATED_ACTION:
+                    # 重复错误继续保留其指纹，避免模型连续多轮执行同一成功 Action
+                    next_successful_signatures.add(action_signature)
 
                 # observation：按工具策略完整保留、摘要、分页或截断后的 JSON 工具结果
                 observation = self.build_observation(result, goal)
@@ -410,6 +409,9 @@ class Agent:
                     "content": observation,
                 }
                 messages.append(tool_message)
+
+            # 本批处理完成后一次性替换跨轮去重集合，允许非连续 Action 再次执行
+            last_successful_signatures = next_successful_signatures
 
             # 工具调用全部成功时清空连续纠错计数
             if not has_recoverable_failure:

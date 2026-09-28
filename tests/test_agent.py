@@ -252,6 +252,49 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertTrue(observation["error"]["model_recoverable"])
         self.assertEqual(observation["attempts"], 0)
 
+    # 验证上一批所有成功 Action 都会在下一轮被识别为立即重复
+    def test_previous_batch_successful_actions_are_all_blocked(self):
+        # executor：只为第一批两个不同 Action 提供成功结果
+        executor = FakeExecutor([
+            ToolResult.success("calculator", 2),
+            ToolResult.success("calculator", 4),
+        ])
+        # first_batch：第一轮同时执行的两个不同计算 Action
+        first_batch = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                tool_response("calculator", {"expression": "1+1"}, "call_1")["tool_calls"][0],
+                tool_response("calculator", {"expression": "2+2"}, "call_2")["tool_calls"][0],
+            ],
+        }
+        # repeated_batch：第二轮按相同顺序重复上一批全部 Action
+        repeated_batch = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                tool_response("calculator", {"expression": "1+1"}, "call_3")["tool_calls"][0],
+                tool_response("calculator", {"expression": "2+2"}, "call_4")["tool_calls"][0],
+            ],
+        }
+        # agent：执行两批调用后使用已有结果结束任务
+        agent = ScriptedAgent(
+            [first_batch, repeated_batch, final_response("使用已有结果")],
+            tool_executor=executor,
+        )
+
+        self.assertEqual(agent.run("分别计算 1+1 和 2+2"), "使用已有结果")
+        self.assertEqual(len(executor.calls), 2)
+        # observations：第三轮模型调用前收到的两个重复 Action 结果
+        observations = [
+            json.loads(message["content"])
+            for message in agent.seen_messages[2][-2:]
+        ]
+        self.assertEqual(
+            [item["error"]["code"] for item in observations],
+            ["repeated_action", "repeated_action"],
+        )
+
     # 验证 Schema 默认值会参与 Action 指纹的标准化
     def test_action_signature_applies_schema_defaults(self):
         # executor：使用真实工具 Schema 但返回模拟搜索结果的执行器

@@ -783,6 +783,27 @@ def get_tool_schemas(registry=None):
     return schemas
 
 
+# 将单个工具参数格式化为安全且有长度限制的日志文本
+# name：工具参数名称
+# value：模型为该参数生成的值
+def _format_action_argument(name, value):
+    # normalized_name：用于识别敏感字段和大文本字段的小写参数名
+    normalized_name = name.lower()
+    if any(marker in normalized_name for marker in ("password", "token", "secret", "api_key")):
+        return "<已隐藏>"
+    if normalized_name == "content" and isinstance(value, str):
+        return f"<{len(value)} 字符>"
+
+    # text：将复杂参数转换成稳定且不会转义中文的紧凑 JSON 文本
+    if isinstance(value, str):
+        text = value.replace("\r", "\\r").replace("\n", "\\n")
+    else:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    # max_chars：单个 Action 参数在日志中允许展示的最大字符数
+    max_chars = 160
+    return text if len(text) <= max_chars else text[:max_chars] + "…"
+
+
 # 将工具调用格式化为 ReAct 日志中的 Action 文本
 # name：工具注册名称
 # args：工具参数字典
@@ -797,9 +818,24 @@ def format_tool_action(name, args, registry=None):
     # label：日志中使用的工具显示名称
     label = tool.display_name if tool else name
 
-    # value：日志中展示的首个工具参数值
-    value = next(iter(args.values()), "") if isinstance(args, dict) else args
-    return f"{label}[{value}]"
+    if not isinstance(args, dict):
+        return f"{label}[{_format_action_argument('arguments', args)}]"
+
+    # schema_order：工具 Schema 中定义的稳定参数展示顺序
+    schema_order = []
+    if tool:
+        schema_order = list(
+            tool.schema["function"]["parameters"].get("properties", {})
+        )
+    # ordered_names：先按 Schema 排列，再保留不在 Schema 中的异常参数供排查
+    ordered_names = [key for key in schema_order if key in args]
+    ordered_names.extend(key for key in args if key not in ordered_names)
+    # formatted_args：包含参数名称和值的可区分 Action 日志片段
+    formatted_args = ", ".join(
+        f"{key}={_format_action_argument(key, args[key])}"
+        for key in ordered_names
+    )
+    return f"{label}[{formatted_args}]"
 
 
 # 根据注册名称校验参数并执行工具
