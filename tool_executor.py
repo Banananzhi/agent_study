@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from resource_lock import DEFAULT_RESOURCE_LOCK_MANAGER, ResourceLease
+from tool_execution_policy import PolicyAction, ToolExecutionPolicy
 from tool_result import ERROR_POLICIES, ErrorCode, ToolResult
 from tools import (
     TOOLS,
@@ -36,11 +37,20 @@ class ToolExecutor:
     # sleeper：等待函数，测试时可注入替代实现
     # jitter_fn：随机抖动函数，测试时可注入替代实现
     # lock_manager：为单独和批量工具执行提供共享资源租约的锁管理器
-    def __init__(self, registry=None, sleeper=None, jitter_fn=None, lock_manager=None):
+    # execution_policy：在资源调度前判断工具副作用是否允许的统一策略
+    def __init__(
+        self,
+        registry=None,
+        sleeper=None,
+        jitter_fn=None,
+        lock_manager=None,
+        execution_policy=None,
+    ):
         self.registry = TOOLS if registry is None else registry
         self.sleeper = sleeper or time.sleep
         self.jitter_fn = jitter_fn or random.uniform
         self.lock_manager = lock_manager or DEFAULT_RESOURCE_LOCK_MANAGER
+        self.execution_policy = execution_policy or ToolExecutionPolicy()
 
     # 查找与未知名称最接近的少量工具
     # name：模型生成的工具名称
@@ -76,7 +86,31 @@ class ToolExecutor:
                 duration_ms=self._elapsed_ms(started_at),
             )
 
-        # 3. 根据工具参数解析读、写或独占资源，供批量调度和执行锁保护
+        # 3. 在资源调度前由程序策略判断本次副作用是否允许执行
+        # policy_decision：当前工具副作用等级对应的执行策略决定
+        policy_decision = self.execution_policy.evaluate(tool, args)
+        logger.info(
+            "🛡️ 工具策略: %s，副作用=%s，决定=%s",
+            name,
+            tool.side_effect_level.value,
+            policy_decision.action.value,
+        )
+        if policy_decision.action == PolicyAction.REQUIRE_APPROVAL:
+            return ToolResult.failure(
+                name,
+                ErrorCode.APPROVAL_REQUIRED,
+                policy_decision.reason,
+                duration_ms=self._elapsed_ms(started_at),
+            )
+        if policy_decision.action == PolicyAction.DENY:
+            return ToolResult.failure(
+                name,
+                ErrorCode.POLICY_DENIED,
+                policy_decision.reason,
+                duration_ms=self._elapsed_ms(started_at),
+            )
+
+        # 4. 根据工具参数解析读、写或独占资源，供批量调度和执行锁保护
         try:
             # resources：工具本次调用需要一次性获取的资源声明
             resources = tool.resolve_resources(args)

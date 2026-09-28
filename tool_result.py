@@ -14,6 +14,8 @@ class ErrorCode(str, Enum):
     AUTHENTICATION_ERROR = "authentication_error"
     SERVER_ERROR = "server_error"
     UNSAFE_REQUEST = "unsafe_request"
+    APPROVAL_REQUIRED = "approval_required"
+    POLICY_DENIED = "policy_denied"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -28,6 +30,8 @@ ERROR_POLICIES = {
     ErrorCode.AUTHENTICATION_ERROR: (False, False),
     ErrorCode.SERVER_ERROR: (True, False),
     ErrorCode.UNSAFE_REQUEST: (False, False),
+    ErrorCode.APPROVAL_REQUIRED: (False, False),
+    ErrorCode.POLICY_DENIED: (False, False),
     ErrorCode.INTERNAL_ERROR: (False, False),
 }
 

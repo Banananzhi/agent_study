@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel
 
 from resource_lock import AccessMode, ResourceAccess
+from tool_execution_policy import SideEffectLevel
 from tool_models import (
     CalculatorOutput,
     CurrentTimeOutput,
@@ -391,6 +392,8 @@ class Tool:
     idempotent: bool = True
     observation_policy: ObservationPolicy = ObservationPolicy.TRUNCATE
     resource_resolver: Callable[[dict], tuple] | None = None
+    # side_effect_level：工具改变本地或外部状态的副作用等级
+    side_effect_level: SideEffectLevel = SideEffectLevel.NONE
 
     # 校验工具的输入、输出 Schema 和显示名称
     def __post_init__(self):
@@ -409,6 +412,8 @@ class Tool:
             raise ValueError("observation_policy 必须是 ObservationPolicy 枚举")
         if self.resource_resolver is not None and not callable(self.resource_resolver):
             raise ValueError("resource_resolver 必须为空或可调用对象")
+        if not isinstance(self.side_effect_level, SideEffectLevel):
+            raise ValueError("side_effect_level 必须是 SideEffectLevel 枚举")
 
     # 获取工具在注册表中的标准名称
     @property
@@ -633,6 +638,7 @@ TOOLS = {}
 # idempotent：工具能否安全地重复执行
 # observation_policy：工具长结果进入模型上下文前的处理策略
 # resource_resolver：根据已校验参数生成资源访问声明的函数
+# side_effect_level：工具改变本地或外部状态的副作用等级
 def register_tool(
     function,
     schema,
@@ -642,6 +648,7 @@ def register_tool(
     idempotent=True,
     observation_policy=ObservationPolicy.TRUNCATE,
     resource_resolver=None,
+    side_effect_level=SideEffectLevel.NONE,
 ):
     if schema.get("type") != "function" or not isinstance(schema.get("function"), dict):
         raise ValueError("工具 Schema 必须是标准 function 类型")
@@ -660,6 +667,7 @@ def register_tool(
         idempotent=idempotent,
         observation_policy=observation_policy,
         resource_resolver=resource_resolver,
+        side_effect_level=side_effect_level,
     )
 
 
@@ -701,6 +709,7 @@ register_tool(
     idempotent=False,
     observation_policy=ObservationPolicy.RAW,
     resource_resolver=file_write_resources,
+    side_effect_level=SideEffectLevel.LOCAL_WRITE,
 )
 register_tool(
     write_file,
@@ -710,6 +719,7 @@ register_tool(
     idempotent=False,
     observation_policy=ObservationPolicy.RAW,
     resource_resolver=file_write_resources,
+    side_effect_level=SideEffectLevel.LOCAL_WRITE,
 )
 register_tool(
     read_file,
