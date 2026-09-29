@@ -3,10 +3,10 @@ import os
 import sys
 
 from agent import Agent, AgentToolError
-from mcp_client import MCPClientManager, MCPServerConfig
-from tool_execution_policy import SideEffectLevel
-from tool_executor import ToolExecutor
-from tools import TOOLS
+from integrations.mcp import MCPClientManager, MCPServerConfig
+from tooling.executor import ToolExecutor
+from tooling.policy import SideEffectLevel
+from tooling.registry import TOOLS
 
 
 # 启动一次单轮命令行对话

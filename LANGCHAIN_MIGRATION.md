@@ -35,7 +35,7 @@ LangGraph
 
 迁移时验证了 `langchain-mcp-adapters 0.3.1`，但它与当前 FastMCP 使用的 MCP SDK 存在 `RequestContext` 导入冲突，因此没有保留。后续 MCP Client 直接基于 FastMCP 实现，再适配到项目工具注册表。
 
-### `agent.py`
+### `agent/runtime.py`
 
 - 删除 `urllib.request` 和手工 DeepSeek HTTP 请求。
 - 使用 `ChatDeepSeek` 和 `bind_tools()`。
@@ -182,7 +182,7 @@ ToolResult 错误策略决定恢复或终止
 uv run python -m unittest discover -s tests -v
 ```
 
-48 项测试通过，覆盖 LangChain 工具绑定、LangGraph 路由、批量工具调用、错误恢复、Action 去重、自动重试、资源锁、副作用策略和 Observation 管理。
+50 项测试通过，覆盖 LangChain 工具绑定、LangGraph 路由、批量工具调用、错误恢复、Action 去重、自动重试、资源锁、副作用策略、MCP 适配和 Observation 管理。
 
 此外使用真实 DeepSeek 接口完成了 `123 + 456` 冒烟测试，实际链路为：
 
@@ -232,3 +232,16 @@ DeepSeek
 ```
 
 后续可以继续学习 LangGraph Checkpointer、上下文裁剪、长期记忆和人工审批恢复。
+
+## 目录结构演进
+
+随着工具执行、资源调度和 MCP 集成逐步增加，项目已不再把所有模块平铺在根目录。当前按职责划分为：
+
+```text
+agent/        LangGraph 编排、配置和结果摘要
+tooling/      工具定义、契约、执行、策略、调度和资源锁
+integrations/ FastMCP 等外部协议适配
+main.py       应用入口和依赖组装
+```
+
+本次只调整模块边界和导入路径，没有保留旧模块兼容副本，也没有改变 Agent Loop、工具注册或执行策略。

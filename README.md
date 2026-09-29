@@ -1,4 +1,4 @@
-# Minimal Agent Loop
+# Agent Study
 
 当前项目使用 LangChain 适配 DeepSeek 与消息协议，使用 LangGraph 管理 Agent 状态和循环；自定义执行层继续负责批量调度、资源锁、重试、副作用策略和 Observation 管理。
 
@@ -12,9 +12,33 @@
 
 连接失败时自动降级为只使用本地工具。可通过 `.env` 中的 `DEEPWIKI_MCP_URL` 覆盖默认地址 `https://mcp.deepwiki.com/mcp`。
 
+## 项目结构
+
+```text
+agent-study/
+├─ main.py                  # 命令行入口和依赖组装
+├─ agent/                   # Agent 编排层
+│  ├─ runtime.py            # LangGraph、AgentState 和模型/工具节点
+│  ├─ config.py             # .env 配置加载
+│  └─ summarizer.py         # 长工具结果摘要
+├─ tooling/                 # 工具领域与执行基础设施
+│  ├─ registry.py           # 本地工具定义、Schema 和注册表
+│  ├─ models.py             # Pydantic 工具返回模型
+│  ├─ result.py             # ToolResult 和稳定错误码
+│  ├─ policy.py             # 副作用等级与执行策略
+│  ├─ executor.py           # 单工具校验、执行和重试
+│  ├─ scheduler.py          # 批量资源感知调度
+│  └─ resources.py          # 资源声明与进程内资源锁
+├─ integrations/            # 外部协议与服务适配
+│  └─ mcp.py                # FastMCP Client 和 MCP Tool 适配
+└─ tests/                   # Agent、工具和执行层测试
+```
+
+依赖方向保持单向：`main → agent/integrations → tooling`。工具基础设施不依赖 Agent 编排层，后续增加其他模型、MCP Server 或调用入口时不需要改动底层执行策略。
+
 ## 工具
 
-工具统一定义和注册在 `tools.py`：
+工具统一定义和注册在 `tooling/registry.py`：
 
 - `calculator`：基础算术计算
 - `web_search`：通过博查搜索实时网页信息
@@ -41,8 +65,6 @@ BOCHA_API_KEY=你的博查API-Key
 BOCHA_BASE_URL=https://api.bochaai.com/v1/web-search
 ```
 
-一个不依赖 LangChain、也不依赖第三方 Python 包的最小 Agent Loop。模型可以决定直接回答，或调用内置的安全计算器，再根据工具结果生成最终答案。
-
 ## 运行
 
 先编辑项目根目录的 `.env`，将占位符替换成自己的真实 DeepSeek API Key：
@@ -65,10 +87,10 @@ python main.py
 
 `.env` 已被 Git 忽略。如果你使用的第三方服务确实提供 `deepseek-flash`，请在 `.env` 中同时修改模型名和服务地址。
 
-`agent.py` 包含 `Agent` 类及所有实现细节：`think` 返回 DeepSeek 原生 assistant 消息，`act` 解析并执行 `tool_calls`，`run` 负责完整循环。工具结果会通过包含 `tool_call_id` 的 `tool` 消息回传模型；模型不再返回 `tool_calls` 时，其 `content` 就是最终答案。`main.py` 只负责创建 Agent 和调用 `run`。
+`agent/runtime.py` 包含 `Agent`、`AgentState` 和 LangGraph 节点：`think` 返回标准 `AIMessage`，自定义 `tools` 节点解析并执行 `tool_calls`，`run` 启动编译后的图。工具结果会通过包含 `tool_call_id` 的 `ToolMessage` 回传模型；模型不再返回 `tool_calls` 时，其 `content` 就是最终答案。`main.py` 只负责连接 MCP、组装依赖、创建 Agent 和调用 `run`。
 
 Agent 会使用“工具名称 + 按 Schema 补齐默认值后的标准参数”生成 Action 指纹。如果上一个 Action 已经成功，模型又立即生成完全相同的调用，Agent 会拦截重复执行并通过 `repeated_action` Observation 要求模型使用已有结果或调整调用。
 
 单条 Observation 默认限制为 8000 个字符，可通过 `Agent(max_observation_chars=...)` 调整。超限时会保留合法 JSON 结构，优先截断成功结果的 `value` 或失败结果的 `error.message`，并在 `truncation` 中返回原始长度和实际保留长度。
 
-默认中文系统提示词定义在 `agent.py` 的 `SYSTEM` 常量中，也可以通过 `Agent(system="...")` 覆盖。
+默认中文系统提示词定义在 `agent/runtime.py` 的 `SYSTEM` 常量中，也可以通过 `Agent(system="...")` 覆盖。
