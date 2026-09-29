@@ -6,11 +6,21 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from fastmcp import Client
+from fastmcp.exceptions import (
+    AuthorizationError as FastMCPAuthorizationError,
+    ClientError as FastMCPClientError,
+    ToolError as FastMCPToolError,
+    ValidationError as FastMCPValidationError,
+)
+from mcp.shared.exceptions import MCPError as SDKMCPError
 from pydantic import RootModel
 
+from tooling.errors import ClassifiedToolError
 from tooling.policy import SideEffectLevel
 from tooling.registry import ObservationPolicy, Tool
+from tooling.result import ErrorCode
 
 
 logger = logging.getLogger(__name__)
@@ -20,8 +30,64 @@ class MCPToolOutput(RootModel[Any]):
     """返回 MCP Server 提供的结构化数据或文本内容。"""
 
 
-class MCPToolExecutionError(ValueError):
-    pass
+class MCPToolExecutionError(ClassifiedToolError):
+    """MCP 适配层已经归一化并可交给 ToolExecutor 路由的异常。"""
+
+
+class MCPInvalidArgumentsError(MCPToolExecutionError):
+    # 初始化可由模型修改参数后恢复的 MCP 参数错误
+    # message：MCP Server 返回的参数错误说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.INVALID_ARGUMENTS, message)
+
+
+class MCPConnectionError(MCPToolExecutionError):
+    # 初始化允许幂等工具自动重试的 MCP 连接错误
+    # message：不包含认证信息的连接错误说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.NETWORK_ERROR, message)
+
+
+class MCPTimeoutError(MCPToolExecutionError):
+    # 初始化允许幂等工具自动重试的 MCP 超时错误
+    # message：本次超时操作的简短说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.TIMEOUT, message)
+
+
+class MCPAuthenticationError(MCPToolExecutionError):
+    # 初始化不能通过重试恢复的 MCP 认证错误
+    # message：认证或授权失败的安全说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.AUTHENTICATION_ERROR, message)
+
+
+class MCPRateLimitError(MCPToolExecutionError):
+    # 初始化允许幂等工具自动重试的 MCP 限流错误
+    # message：远程服务限流的安全说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.RATE_LIMITED, message)
+
+
+class MCPServerError(MCPToolExecutionError):
+    # 初始化允许幂等工具自动重试的 MCP 服务端错误
+    # message：远程服务暂时不可用的安全说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.SERVER_ERROR, message)
+
+
+class MCPRemoteExecutionError(MCPToolExecutionError):
+    # 初始化需要模型根据远程反馈调整调用的业务执行错误
+    # message：MCP Tool 返回的业务失败说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.REMOTE_ERROR, message)
+
+
+class MCPProtocolError(MCPToolExecutionError):
+    # 初始化无法由模型或自动重试恢复的 MCP 协议错误
+    # message：协议响应或本地 MCP 状态异常的安全说明
+    def __init__(self, message):
+        super().__init__(ErrorCode.PROTOCOL_ERROR, message)
 
 
 @dataclass(frozen=True)
@@ -176,7 +242,59 @@ class MCPClientManager:
             return future.result(timeout=timeout)
         except FutureTimeoutError as error:
             future.cancel()
-            raise TimeoutError("MCP 操作超时") from error
+            raise MCPTimeoutError("MCP 操作超时") from error
+
+    # 将 FastMCP、MCP SDK 和 HTTP Client 异常归一化为稳定的 MCP 错误类型
+    # error：MCP 连接、发现或调用阶段抛出的原始异常
+    # operation：用于安全错误说明的当前操作名称
+    @staticmethod
+    def _classify_client_exception(error, operation):
+        if isinstance(error, MCPToolExecutionError):
+            return error
+        if isinstance(error, FastMCPAuthorizationError):
+            return MCPAuthenticationError(f"MCP {operation}认证或授权失败")
+        if isinstance(error, FastMCPValidationError):
+            return MCPInvalidArgumentsError(str(error) or f"MCP {operation}参数无效")
+        if isinstance(error, SDKMCPError):
+            # error_code：MCP SDK 从 JSON-RPC 错误响应中解析出的数字错误码
+            error_code = error.code
+            if error_code == -32602:
+                return MCPInvalidArgumentsError(error.message)
+            if error_code in {-32700, -32600, -32601}:
+                return MCPProtocolError(
+                    f"MCP {operation}协议错误 [{error_code}]：{error.message}"
+                )
+            if error_code == -32603:
+                return MCPServerError(f"MCP Server 内部错误：{error.message}")
+            return MCPRemoteExecutionError(error.message)
+        if isinstance(error, httpx.HTTPStatusError):
+            # status_code：MCP HTTP 传输返回的状态码
+            status_code = error.response.status_code
+            if status_code in {401, 403}:
+                return MCPAuthenticationError(
+                    f"MCP {operation}认证失败，HTTP {status_code}"
+                )
+            if status_code == 429:
+                return MCPRateLimitError("MCP Server 请求过于频繁，HTTP 429")
+            if 500 <= status_code <= 599:
+                return MCPServerError(
+                    f"MCP Server 暂时不可用，HTTP {status_code}"
+                )
+            return MCPRemoteExecutionError(
+                f"MCP {operation}失败，HTTP {status_code}"
+            )
+        if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+            return MCPTimeoutError(f"MCP {operation}超时")
+        if isinstance(
+            error,
+            (httpx.TransportError, FastMCPClientError, ConnectionError, OSError),
+        ):
+            return MCPConnectionError(f"MCP {operation}网络连接失败")
+        if isinstance(error, FastMCPToolError):
+            return MCPRemoteExecutionError(str(error) or "MCP Tool 执行失败")
+        return MCPProtocolError(
+            f"MCP {operation}返回无法识别的异常：{type(error).__name__}"
+        )
 
     # 连接全部 Server、发现工具并返回可与本地工具合并的注册表
     def connect(self):
@@ -213,9 +331,13 @@ class MCPClientManager:
                     registry[tool.name] = tool
                 logger.info("✅ MCP Server %s 已发现 %d 个工具", config.name, len(tools))
             return registry
-        except Exception:
+        except Exception as error:
             await self._close_all()
-            raise
+            # classified_error：屏蔽底层库差异后的稳定 MCP 异常
+            classified_error = self._classify_client_exception(error, "连接或工具发现")
+            if classified_error is error:
+                raise
+            raise classified_error from error
 
     # 同步调用一个已经连接的远程 MCP 工具
     # server_name：目标 Server 的本地配置名称
@@ -224,7 +346,7 @@ class MCPClientManager:
     def call_tool(self, server_name, tool_name, arguments):
         config = self.configs.get(server_name)
         if config is None:
-            raise MCPToolExecutionError(f"未知 MCP Server：{server_name}")
+            raise MCPProtocolError(f"未知 MCP Server：{server_name}")
         return self._submit(
             self._call_tool(server_name, tool_name, arguments),
             config.timeout + 1,
@@ -237,21 +359,28 @@ class MCPClientManager:
     async def _call_tool(self, server_name, tool_name, arguments):
         client = self.clients.get(server_name)
         if client is None:
-            raise MCPToolExecutionError(f"MCP Server 尚未连接：{server_name}")
+            raise MCPConnectionError(f"MCP Server 尚未连接：{server_name}")
         logger.info("🌐 正在调用 MCP 工具: %s/%s", server_name, tool_name)
-        # result：FastMCP 对标准 CallToolResult 的便捷封装
-        result = await client.call_tool(
-            tool_name,
-            arguments,
-            raise_on_error=False,
-        )
+        try:
+            # result：FastMCP 对标准 CallToolResult 的便捷封装
+            result = await client.call_tool(
+                tool_name,
+                arguments,
+                raise_on_error=False,
+            )
+        except Exception as error:
+            # classified_error：根据 SDK、JSON-RPC 或 HTTP 异常确定恢复策略
+            classified_error = self._classify_client_exception(error, "工具调用")
+            if classified_error is error:
+                raise
+            raise classified_error from error
         if result.is_error:
             # message：合并远程文本错误块后返回统一工具错误
             message = "\n".join(
                 getattr(item, "text", str(item))
                 for item in result.content
             ) or "MCP Server 返回工具执行错误"
-            raise MCPToolExecutionError(message)
+            raise MCPRemoteExecutionError(message)
         if result.data is not None:
             return result.data
         if result.structured_content is not None:

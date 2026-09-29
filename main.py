@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 
-from agent import Agent, AgentToolError
+from agent import Agent, AgentToolError, ContextWindowError
 from integrations.mcp import MCPClientManager, MCPServerConfig
 from tooling.executor import ToolExecutor
 from tooling.policy import SideEffectLevel
@@ -47,7 +47,7 @@ def main():
             return
         try:
             answer = agent.run(question)
-        except AgentToolError as error:
+        except (AgentToolError, ContextWindowError) as error:
             print(f"Assistant: 任务已终止，{error}")
             return
         print(f"Assistant: {answer}")

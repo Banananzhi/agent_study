@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from tooling.errors import ClassifiedToolError
 from tooling.policy import PolicyAction, ToolExecutionPolicy
 from tooling.registry import (
     TOOLS,
@@ -281,6 +282,8 @@ class ToolExecutor:
     @staticmethod
     def _classify_exception(error):
         # 按从具体到通用的顺序匹配，避免父类提前吞掉子类异常
+        if isinstance(error, ClassifiedToolError):
+            return error.error_code, str(error)
         if isinstance(error, ToolAuthenticationError):
             return ErrorCode.AUTHENTICATION_ERROR, str(error)
         if isinstance(error, urllib.error.HTTPError):

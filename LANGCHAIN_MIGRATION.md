@@ -182,7 +182,7 @@ ToolResult 错误策略决定恢复或终止
 uv run python -m unittest discover -s tests -v
 ```
 
-50 项测试通过，覆盖 LangChain 工具绑定、LangGraph 路由、批量工具调用、错误恢复、Action 去重、自动重试、资源锁、副作用策略、MCP 适配和 Observation 管理。
+54 项测试通过，覆盖 LangChain 工具绑定、LangGraph 路由、批量工具调用、错误恢复、Action 去重、自动重试、资源锁、副作用策略、MCP 适配和 Observation 管理。
 
 此外使用真实 DeepSeek 接口完成了 `123 + 456` 冒烟测试，实际链路为：
 
@@ -218,6 +218,8 @@ ChatDeepSeek.bind_tools()
 - MCP `input_schema` 转换为现有 Function Tool Schema。
 - MCP annotations 映射为副作用等级和幂等属性；DeepWiki 配置为已知只读 Server。
 - `call_tool()` 结果转换为现有 Tool 业务值，继续复用 `ToolExecutor`、`ToolResult` 和 Observation 管理。
+- MCP 参数、连接、超时、认证、限流、服务端、远程业务和协议异常会在适配边界转换成稳定错误码。
+- 连接类故障由程序按幂等策略重试，远程业务错误交给模型修正，认证与协议错误立即终止。
 - MCP 连接失败时保留本地工具并继续启动 Agent。
 
 已通过真实链路验证：

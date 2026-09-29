@@ -13,6 +13,8 @@ class ErrorCode(str, Enum):
     RATE_LIMITED = "rate_limited"
     AUTHENTICATION_ERROR = "authentication_error"
     SERVER_ERROR = "server_error"
+    REMOTE_ERROR = "remote_error"
+    PROTOCOL_ERROR = "protocol_error"
     UNSAFE_REQUEST = "unsafe_request"
     APPROVAL_REQUIRED = "approval_required"
     POLICY_DENIED = "policy_denied"
@@ -29,6 +31,8 @@ ERROR_POLICIES = {
     ErrorCode.RATE_LIMITED: (True, False),
     ErrorCode.AUTHENTICATION_ERROR: (False, False),
     ErrorCode.SERVER_ERROR: (True, False),
+    ErrorCode.REMOTE_ERROR: (False, True),
+    ErrorCode.PROTOCOL_ERROR: (False, False),
     ErrorCode.UNSAFE_REQUEST: (False, False),
     ErrorCode.APPROVAL_REQUIRED: (False, False),
     ErrorCode.POLICY_DENIED: (False, False),

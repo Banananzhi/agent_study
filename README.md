@@ -20,11 +20,13 @@ agent-study/
 ├─ agent/                   # Agent 编排层
 │  ├─ runtime.py            # LangGraph、AgentState 和模型/工具节点
 │  ├─ config.py             # .env 配置加载
+│  ├─ context.py            # 全局上下文预算、计数和压缩
 │  └─ summarizer.py         # 长工具结果摘要
 ├─ tooling/                 # 工具领域与执行基础设施
 │  ├─ registry.py           # 本地工具定义、Schema 和注册表
 │  ├─ models.py             # Pydantic 工具返回模型
 │  ├─ result.py             # ToolResult 和稳定错误码
+│  ├─ errors.py             # 已分类工具异常契约
 │  ├─ policy.py             # 副作用等级与执行策略
 │  ├─ executor.py           # 单工具校验、执行和重试
 │  ├─ scheduler.py          # 批量资源感知调度
@@ -54,9 +56,13 @@ agent-study/
 
 工具通过 `observation_policy` 声明长结果处理策略：`web_search` 和 `read_webpage` 使用 `summarize`，`read_file` 使用 `paginate`，短结构化工具使用 `raw`。公共 `ResultSummarizer` 会先按块摘要完整业务结果，再汇总各块摘要；摘要请求不携带工具权限。摘要服务失败时回退到统一截断，错误类 ToolResult 始终保留原有错误码和恢复字段，不交给模型改写。
 
+全局 `ContextManager` 将 Agent 主动使用的上下文限制为 256K Token，并在达到 75%（196608 Token）时自动压缩较早的完整工具执行轮次。Token 估算使用 LangChain `count_tokens_approximately()`，同时计算消息、工具调用参数和每轮请求都会携带的 Tool Schema。LangGraph State 始终保留完整消息，只有本次发给模型的上下文视图会被压缩；压缩结果仍以成对的 `AIMessage(tool_calls)` 和 `ToolMessage` 表达，避免破坏 Function Calling 消息协议。
+
 同一轮的多个原生 `tool_calls` 由 `ToolBatchExecutor` 使用线程池动态调度，默认最大并行数为 4，可通过 `Agent(max_parallel_tools=...)` 调整。调度器只将已经一次性获得全部资源 Lease 的调用提交 Worker，等待锁的调用保留在调度队列中，不占用线程；后续无冲突调用可以先执行，但同资源冲突调用始终保持模型生成时的顺序。`read_file` 申请文件 READ 资源，`create_file` 和 `write_file` 申请 WRITE 资源，因此同文件读读可以并行、读写和写写互斥、不同文件可以并行。最终 ToolResult 与 tool message 始终按原始 `tool_calls` 顺序返回。
 
 工具还通过 `side_effect_level` 独立声明副作用等级：`none`、`local_write`、`external_write` 或 `destructive`。`ToolExecutionPolicy` 在工具进入资源调度和线程池前进行程序化判断；当前默认允许无副作用和本地写入工具，外部写入及破坏性工具返回 `approval_required`，不会实际执行。该字段只负责权限和风险控制，并行关系仍由具体资源声明决定。
+
+MCP 适配层会在协议边界将底层 SDK、HTTP 和远程工具错误转换为稳定错误码：参数错误与远程业务错误返回模型修正；连接、超时、限流和服务端错误仅允许幂等工具按策略自动重试；认证和协议错误不能通过修改调用恢复，Agent 会立即终止当前任务。`ToolExecutor` 只读取统一的 `ClassifiedToolError`，不依赖具体 MCP SDK。
 
 使用搜索前，需要在 `.env` 中设置博查 API Key：
 
@@ -73,6 +79,9 @@ BOCHA_BASE_URL=https://api.bochaai.com/v1/web-search
 DEEPSEEK_API_KEY=sk-你的真实API-Key
 DEEPSEEK_MODEL=deepseek-chat
 DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_CONTEXT_TOKENS=1000000
+AGENT_CONTEXT_TOKENS=262144
+AGENT_CONTEXT_COMPRESSION_RATIO=0.75
 ```
 
 然后运行：
