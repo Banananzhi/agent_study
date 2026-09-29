@@ -4,6 +4,14 @@
 
 迁移过程以及手写实现与框架实现的逐项对比见 [LANGCHAIN_MIGRATION.md](LANGCHAIN_MIGRATION.md)。
 
+启动时还会使用 FastMCP Client 连接只读的 DeepWiki 公共 MCP Server，通过 `list_tools()` 动态注册以下工具：
+
+- `deepwiki__ask_wiki_question`
+- `deepwiki__read_wiki_contents`
+- `deepwiki__read_wiki_structure`
+
+连接失败时自动降级为只使用本地工具。可通过 `.env` 中的 `DEEPWIKI_MCP_URL` 覆盖默认地址 `https://mcp.deepwiki.com/mcp`。
+
 ## 工具
 
 工具统一定义和注册在 `tools.py`：

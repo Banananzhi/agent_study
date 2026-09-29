@@ -195,9 +195,9 @@ ChatDeepSeek
 → ChatDeepSeek 最终答案 579
 ```
 
-## 后续方向
+## FastMCP 远程工具接入
 
-下一步基于 FastMCP 实现 `MCPClientManager`：
+项目已经基于 FastMCP 实现 `MCPClientManager`，启动时连接 DeepWiki 公共 MCP Server：
 
 ```text
 FastMCP Client.list_tools()
@@ -211,4 +211,24 @@ ChatDeepSeek.bind_tools()
 模型调用后路由到 FastMCP Client.call_tool()
 ```
 
-完成 MCP 后，再学习 LangGraph Checkpointer、上下文裁剪、长期记忆和人工审批恢复。
+实现要点：
+
+- FastMCP Client 在独立 asyncio 事件循环线程中保持 Session，不为每次工具调用重建连接。
+- 远程工具增加 `deepwiki__` 命名空间，避免与本地工具重名。
+- MCP `input_schema` 转换为现有 Function Tool Schema。
+- MCP annotations 映射为副作用等级和幂等属性；DeepWiki 配置为已知只读 Server。
+- `call_tool()` 结果转换为现有 Tool 业务值，继续复用 `ToolExecutor`、`ToolResult` 和 Observation 管理。
+- MCP 连接失败时保留本地工具并继续启动 Agent。
+
+已通过真实链路验证：
+
+```text
+DeepSeek
+→ deepwiki__read_wiki_structure
+→ FastMCP Client.call_tool
+→ DeepWiki MCP Server
+→ ToolResult / ToolMessage
+→ DeepSeek 最终答案
+```
+
+后续可以继续学习 LangGraph Checkpointer、上下文裁剪、长期记忆和人工审批恢复。
