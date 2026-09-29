@@ -1,5 +1,9 @@
 # Minimal Agent Loop
 
+当前项目使用 LangChain 适配 DeepSeek 与消息协议，使用 LangGraph 管理 Agent 状态和循环；自定义执行层继续负责批量调度、资源锁、重试、副作用策略和 Observation 管理。
+
+迁移过程以及手写实现与框架实现的逐项对比见 [LANGCHAIN_MIGRATION.md](LANGCHAIN_MIGRATION.md)。
+
 ## 工具
 
 工具统一定义和注册在 `tools.py`：

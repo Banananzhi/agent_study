@@ -10,6 +10,8 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # LangChain 底层 HTTP 客户端日志降级，避免混入非 Agent 流程的英文请求行
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     agent = Agent()
     question = input("User: ").strip()
     if not question:
