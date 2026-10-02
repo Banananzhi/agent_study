@@ -16,5 +16,8 @@ wheels/
 # Local secrets
 .env
 
+# Agent runtime state
+.agent_data/
+
 /tests/
 /output/

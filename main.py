@@ -9,7 +9,7 @@ from tooling.policy import SideEffectLevel
 from tooling.registry import TOOLS
 
 
-# 启动一次单轮命令行对话
+# 启动支持持久化上下文的多轮命令行对话
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -40,17 +40,31 @@ def main():
         logging.getLogger("httpx2").setLevel(logging.WARNING)
         # registry：当前 Agent 独享的本地与 MCP 工具合并注册表
         registry = {**TOOLS, **mcp_tools}
-        agent = Agent(tool_executor=ToolExecutor(registry=registry))
-        question = input("User: ").strip()
-        if not question:
-            print("请输入问题。")
-            return
-        try:
-            answer = agent.run(question)
-        except (AgentToolError, ContextWindowError) as error:
-            print(f"Assistant: 任务已终止，{error}")
-            return
-        print(f"Assistant: {answer}")
+        # checkpoint_path：保存 LangGraph 会话状态的 SQLite 文件路径
+        checkpoint_path = os.getenv(
+            "AGENT_CHECKPOINT_PATH",
+            ".agent_data/checkpoints.sqlite3",
+        )
+        # thread_id：本次命令行程序持续恢复的会话标识
+        thread_id = os.getenv("AGENT_THREAD_ID", "default")
+        with Agent(
+            tool_executor=ToolExecutor(registry=registry),
+            checkpoint_path=checkpoint_path,
+        ) as agent:
+            logging.getLogger(__name__).info("💬 当前会话: %s（输入 exit 退出）", thread_id)
+            while True:
+                question = input("User: ").strip()
+                if question.lower() in {"exit", "quit", "退出"}:
+                    break
+                if not question:
+                    print("请输入问题。")
+                    continue
+                try:
+                    answer = agent.run(question, thread_id=thread_id)
+                except (AgentToolError, ContextWindowError) as error:
+                    print(f"Assistant: 任务已终止，{error}")
+                    continue
+                print(f"Assistant: {answer}")
     finally:
         mcp_manager.close()
 

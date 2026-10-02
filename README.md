@@ -58,6 +58,8 @@ agent-study/
 
 全局 `ContextManager` 将 Agent 主动使用的上下文限制为 256K Token，并在达到 75%（196608 Token）时自动压缩较早的完整工具执行轮次。Token 估算使用 LangChain `count_tokens_approximately()`，同时计算消息、工具调用参数和每轮请求都会携带的 Tool Schema。LangGraph State 始终保留完整消息，只有本次发给模型的上下文视图会被压缩；压缩结果仍以成对的 `AIMessage(tool_calls)` 和 `ToolMessage` 表达，避免破坏 Function Calling 消息协议。
 
+多轮会话使用持久化滚动摘要管理较早历史。当模型输入达到 196608 Token 时触发，尝试压回 131072 Token；默认保留最近 6 个已完成用户轮次的原文，仍过长时逐轮缩小到最近 2 轮，当前未完成轮次始终完整保留。`session_summary` 目标上限为 12288 Token、硬上限为 16384 Token，`summary_cursor` 用于避免重复摘要同一段历史；两者都随 LangGraph Checkpoint 持久化。如果会话摘要后仍超过目标线，再使用原有工具轮次压缩作为第二层保护。
+
 同一轮的多个原生 `tool_calls` 由 `ToolBatchExecutor` 使用线程池动态调度，默认最大并行数为 4，可通过 `Agent(max_parallel_tools=...)` 调整。调度器只将已经一次性获得全部资源 Lease 的调用提交 Worker，等待锁的调用保留在调度队列中，不占用线程；后续无冲突调用可以先执行，但同资源冲突调用始终保持模型生成时的顺序。`read_file` 申请文件 READ 资源，`create_file` 和 `write_file` 申请 WRITE 资源，因此同文件读读可以并行、读写和写写互斥、不同文件可以并行。最终 ToolResult 与 tool message 始终按原始 `tool_calls` 顺序返回。
 
 工具还通过 `side_effect_level` 独立声明副作用等级：`none`、`local_write`、`external_write` 或 `destructive`。`ToolExecutionPolicy` 在工具进入资源调度和线程池前进行程序化判断；当前默认允许无副作用和本地写入工具，外部写入及破坏性工具返回 `approval_required`，不会实际执行。该字段只负责权限和风险控制，并行关系仍由具体资源声明决定。
@@ -82,6 +84,13 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_CONTEXT_TOKENS=1000000
 AGENT_CONTEXT_TOKENS=262144
 AGENT_CONTEXT_COMPRESSION_RATIO=0.75
+AGENT_CONTEXT_TARGET_RATIO=0.5
+AGENT_RECENT_TURNS=6
+AGENT_MIN_RECENT_TURNS=2
+AGENT_SESSION_SUMMARY_TARGET_TOKENS=12288
+AGENT_SESSION_SUMMARY_MAX_TOKENS=16384
+AGENT_CHECKPOINT_PATH=.agent_data/checkpoints.sqlite3
+AGENT_THREAD_ID=default
 ```
 
 然后运行：
@@ -90,7 +99,9 @@ AGENT_CONTEXT_COMPRESSION_RATIO=0.75
 python main.py
 ```
 
-启动后输入一次问题，Agent 输出最终答案后程序结束。这里的“单轮”指用户只进行一次提问；Agent 内部仍可进行多次 `think → act → observe`。
+启动后会进入多轮命令行对话，输入 `exit`、`quit` 或“退出”结束程序。LangGraph SQLite Checkpointer 按 `AGENT_THREAD_ID` 保存完整 State；使用相同 `thread_id` 重启程序后，Agent 仍能恢复之前的 `messages`。更换 `AGENT_THREAD_ID` 可以开始一个独立会话。检查点文件默认保存在 `.agent_data/checkpoints.sqlite3` 并被 Git 忽略。
+
+每次用户输入仍是一个独立任务，因此 `step`、工具纠错次数和重复 Action 指纹都会在新一轮重置；之前的对话消息则会作为会话上下文继续传给模型。
 
 运行期间会输出中文日志，包括步骤、模型名、模型是否决定调用工具、Action、工具执行、Observation 和最终答案；不会伪造模型的内部 Thought，API Key 也不会写入日志。
 
