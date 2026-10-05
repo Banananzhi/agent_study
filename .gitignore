@@ -19,5 +19,6 @@ wheels/
 # Agent runtime state
 .agent_data/
 
-/tests/
+/tests/*
+!/tests/test_memory.py
 /output/

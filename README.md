@@ -75,6 +75,86 @@ BOCHA_BASE_URL=https://api.bochaai.com/v1/web-search
 
 ## 运行
 
+### 启动 Qdrant
+
+项目根目录提供了 `compose.yaml`，安装并启动 Docker Desktop 后执行：
+
+```bash
+docker compose up -d
+```
+
+Qdrant 默认地址：
+
+```text
+HTTP API: http://localhost:6333
+gRPC API: localhost:6334
+Dashboard: http://localhost:6333/dashboard
+```
+
+查看运行状态或停止服务：
+
+```bash
+docker compose ps
+docker compose down
+```
+
+向量数据持久化在 `.agent_data/qdrant`。本地开发默认不需要配置
+`QDRANT_API_KEY`；如果端口被占用，可以在 `.env` 中覆盖：
+
+```dotenv
+QDRANT_HTTP_PORT=6333
+QDRANT_GRPC_PORT=6334
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION=agent_memories
+```
+
+### 长期记忆存储
+
+长期记忆使用 SQLite 保存完整文本与生命周期信息，Qdrant 只保存向量和
+租户、用户等过滤字段。记忆与索引任务通过 SQLite Outbox 在同一事务中写入，
+索引 Worker 负责异步生成向量并幂等同步到 Qdrant。
+
+在 `.env` 中配置：
+
+```dotenv
+AGENT_MEMORY_DB_PATH=.agent_data/memories.sqlite3
+AGENT_TENANT_ID=local
+AGENT_USER_ID=local-user
+AGENT_PROJECT_ID=agent-study
+
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=
+QDRANT_COLLECTION=agent_memories
+
+AGENT_EMBEDDING_MODEL=qwen3.7-text-embedding-flash
+AGENT_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+AGENT_EMBEDDING_API_KEY=你的百炼API-Key
+AGENT_EMBEDDING_TIMEOUT=30
+# 可选；留空时使用模型默认向量维度
+AGENT_EMBEDDING_DIMENSIONS=
+AGENT_MEMORY_WORKER_BATCH_SIZE=16
+AGENT_MEMORY_WORKER_LEASE_SECONDS=120
+AGENT_MEMORY_WORKER_MAX_ATTEMPTS=5
+AGENT_MEMORY_WORKER_POLL_SECONDS=2
+AGENT_MEMORY_RECALL_LIMIT=8
+AGENT_MEMORY_RECALL_MAX_CHARS=8192
+AGENT_MEMORY_EXTRACTION_MAX_CHARS=24000
+AGENT_MEMORY_MIN_IMPORTANCE=0.5
+AGENT_MEMORY_MIN_CONFIDENCE=0.7
+```
+
+独立启动索引 Worker：
+
+```bash
+uv run python -m agent.memory.worker
+```
+
+索引 Worker 通过百炼 OpenAI 兼容接口调用 `qwen3.7-text-embedding-flash`，
+不会在本地下载模型。也可以用 `DASHSCOPE_API_KEY` 代替
+`AGENT_EMBEDDING_API_KEY`。每个新用户轮次开始时只召回一次长期记忆，最终答案
+生成后只提取一次候选记忆；召回和提取失败不会终止主任务。
+
 先编辑项目根目录的 `.env`，将占位符替换成自己的真实 DeepSeek API Key：
 
 ```dotenv

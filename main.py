@@ -3,6 +3,7 @@ import os
 import sys
 
 from agent import Agent, AgentToolError, ContextWindowError
+from agent.memory import create_memory_service
 from integrations.mcp import MCPClientManager, MCPServerConfig
 from tooling.executor import ToolExecutor
 from tooling.policy import SideEffectLevel
@@ -18,6 +19,8 @@ def main():
     # LangChain 底层 HTTP 客户端日志降级，避免混入非 Agent 流程的英文请求行
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpx2").setLevel(logging.WARNING)
+    # memory_service：SQLite、Embedding、Qdrant 与 Outbox 组成的长期记忆服务
+    memory_service = create_memory_service()
     # mcp_manager：维护远程 DeepWiki MCP Session 的持久 Client 管理器
     mcp_manager = MCPClientManager([
         MCPServerConfig(
@@ -50,6 +53,7 @@ def main():
         with Agent(
             tool_executor=ToolExecutor(registry=registry),
             checkpoint_path=checkpoint_path,
+            memory_service=memory_service,
         ) as agent:
             logging.getLogger(__name__).info("💬 当前会话: %s（输入 exit 退出）", thread_id)
             while True:
@@ -67,6 +71,7 @@ def main():
                 print(f"Assistant: {answer}")
     finally:
         mcp_manager.close()
+        memory_service.close()
 
 
 if __name__ == "__main__":
