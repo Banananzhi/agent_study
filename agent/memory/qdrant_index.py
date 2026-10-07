@@ -163,10 +163,11 @@ class QdrantMemoryIndex:
     # vector：当前问题生成的查询向量
     # tenant_id：经过身份认证的租户标识
     # user_id：经过身份认证的用户标识
-    # project_id：需要限定的项目标识，None 表示不限制项目
+    # project_id：当前项目标识，None 表示仅用户级全局记忆
     # memory_types：允许召回的记忆类型
     # limit：最多返回的记忆数量
     # score_threshold：最低语义相关度
+    # exact_project：为 True 时不同时召回全局记忆
     def search(
         self,
         vector,
@@ -176,6 +177,7 @@ class QdrantMemoryIndex:
         memory_types=None,
         limit=8,
         score_threshold=None,
+        exact_project=False,
     ):
         if not vector:
             raise ValueError("vector 不能为空")
@@ -202,7 +204,8 @@ class QdrantMemoryIndex:
                 models.FieldCondition(
                     key="project_id",
                     # 当前项目同时允许召回用户级的全局长期记忆
-                    match=models.MatchAny(any=[project_id, ""]),
+                    match=(models.MatchValue(value=project_id) if exact_project
+                           else models.MatchAny(any=[project_id, ""])),
                 )
             )
         else:

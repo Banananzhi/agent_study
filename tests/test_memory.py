@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,9 @@ from qdrant_client import QdrantClient
 
 from agent import Agent
 from agent.memory.extractor import StructuredMemoryExtractor
+from agent.memory.models import MemoryDecision
+from agent.memory.reconciliation import MemoryReconciler
+from agent.memory.resolver import MemoryConflictResolver
 from agent.memory import (
     IndexJobStatus,
     IndexStatus,
@@ -36,6 +40,10 @@ class StructuredMemoryExtractorTest(unittest.TestCase):
         # request：LangChain 经 OpenAI 客户端发出的请求
         def handler(request):
             captured.append(json.loads(request.content))
+            # result：根据绑定的 Schema 返回对应结构，覆盖提取器与判断器
+            result = (MemoryDecision(action="DEFER", reason="测试判断结果")
+                      if captured[-1]["tools"][0]["function"]["name"] == "MemoryDecision"
+                      else MemoryExtractionBatch())
             return httpx.Response(200, json={
                 "id": "test-extraction",
                 "object": "chat.completion",
@@ -51,8 +59,8 @@ class StructuredMemoryExtractorTest(unittest.TestCase):
                             "id": "call-memory",
                             "type": "function",
                             "function": {
-                                "name": "MemoryExtractionBatch",
-                                "arguments": MemoryExtractionBatch().model_dump_json(),
+                                "name": type(result).__name__,
+                                "arguments": result.model_dump_json(),
                             },
                         }],
                     },
@@ -83,6 +91,16 @@ class StructuredMemoryExtractorTest(unittest.TestCase):
             model.bind_tools([MemoryExtractionBatch], tool_choice="auto").invoke("你好")
             self.assertEqual({"type": "enabled"}, captured[1]["thinking"])
             self.assertEqual("auto", captured[1]["tool_choice"])
+            # resolver：同样禁用 thinking，且请求携带候选和来源原文
+            resolver = MemoryConflictResolver(model)
+            # candidate：仅用于验证判断请求编码与结构化解析
+            candidate = MemoryCandidate(content="偏好短文案", memory_type="preference",
+                                        importance=0.9, confidence=1.0)
+            self.assertEqual("DEFER", resolver.resolve(candidate, [], "测试原文").action)
+            self.assertEqual({"type": "disabled"}, captured[2]["thinking"])
+            self.assertEqual("MemoryDecision", captured[2]["tool_choice"]["function"]["name"])
+            self.assertIn("测试原文", captured[2]["messages"][-1]["content"])
+            self.assertEqual({"type": "enabled"}, model.extra_body["thinking"])
 
 
 class FakeMemoryExtractor:
@@ -278,6 +296,210 @@ class MemoryServiceTest(unittest.TestCase):
         self.assertEqual(IndexJobStatus.PENDING, jobs[0].status)
         self.assertEqual(memory.version, jobs[0].memory_version)
 
+    # 生成带原文证据的记忆候选，便于复用各类冲突测试
+    # content：候选正文；attrs：要覆盖的来源、意图或范围等字段
+    def candidate(self, content="文案最多80字", **attrs):
+        return MemoryCandidate(**{
+            "content": content, "memory_type": "preference", "memory_key": "copy_limit",
+            "importance": 0.9, "confidence": 1.0, "source_kind": "user",
+            "evidence": "以后文案最多80字", "change_intent": "update", **attrs,
+        })
+
+    # 执行冲突管线，替身判断器避免产生真实网络请求
+    # candidate：候选记忆；resolver：固定或动态返回决策的替身
+    # attrs：可信范围的可选覆盖字段
+    def reconcile(self, candidate, resolver, **attrs):
+        # value：将候选正文放入默认测试范围
+        value = self.memory_write(candidate.content, candidate.memory_key).model_copy(update=attrs)
+        return MemoryReconciler(self.service, resolver).reconcile(
+            value, candidate, "以后文案最多80字", [],
+        )
+
+    # 验证相同正文跨键重复不会增加版本、历史或 Outbox
+    def test_exact_duplicate_skips_model_and_index_job(self):
+        # original：尚未同步向量的旧事实
+        original = self.service.remember(self.memory_write("文案最多80字", "old_key"))
+        # resolver：重复规则应该完全绕过模型
+        resolver = Mock()
+        self.assertEqual("NOOP", self.reconcile(self.candidate(), resolver).action)
+        resolver.resolve.assert_not_called()
+        self.assertEqual(1, self.repository.get(original.id).version)
+        self.assertEqual(1, len(self.repository.list_jobs(original.id)))
+        self.service.remember(self.memory_write("文案最多80字", "old_key"))
+        self.assertEqual(1, len(self.repository.list_jobs(original.id)))
+
+    # 验证语义重复不更新正文，即使模型生成了不同稳定键
+    def test_semantic_duplicate_preserves_original(self):
+        # original：旧偏好及固定 NOOP 判断器
+        original = self.service.remember(self.memory_write("文案上限为八十字", "old_key"))
+        # resolver：模拟语义相同的判断
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="NOOP", target_id=original.id, reason="相同字数限制",
+        )))
+        self.assertEqual("NOOP", self.reconcile(self.candidate(), resolver).action)
+        self.assertEqual(1, self.repository.get(original.id).version)
+
+    # 验证明示修改保持 ID 与旧稳定键，归档旧正文并通过 Worker 索引新版本
+    def test_explicit_update_archives_history_and_indexes_new_version(self):
+        # original：已索引的旧字数限制
+        original = self.service.remember(self.memory_write("文案最多45字", "old_key"))
+        self.service.process_pending()
+        # resolver：候选新键仍然指向同一个旧事实
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="UPDATE", target_id=original.id, reason="用户明确修改长期限制",
+        )))
+        self.assertEqual("UPDATE", self.reconcile(self.candidate(), resolver).action)
+        # updated：更新保持稳定标识和旧键，版本递增
+        updated = self.repository.get(original.id)
+        self.assertEqual(("文案最多80字", 2, "old_key"),
+                         (updated.content, updated.version, updated.memory_key))
+        with self.repository._connect() as connection:
+            # history：与新正文、决策、任务原子保存的旧快照
+            history = connection.execute("SELECT snapshot_json FROM memory_versions").fetchone()
+            self.assertEqual("文案最多45字", json.loads(history[0])["content"])
+            self.assertEqual("UPDATE", connection.execute("SELECT action FROM memory_decisions").fetchone()[0])
+        self.assertEqual(1, self.service.process_pending().completed)
+        self.assertEqual("文案最多80字", self.index.upserts[-1][0].content)
+
+    # 验证临时要求、伪造证据和助手复述不会改变用户长期偏好
+    def test_temporary_or_unverified_sources_are_deferred(self):
+        # original：需要保护的长期偏好
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        # attrs：各类不允许更新的来源
+        for attrs in ({"scope_kind": "temporary"}, {"evidence": "不存在的用户原文"},
+                      {"source_kind": "assistant"}):
+            with self.subTest(attrs=attrs):
+                # resolver：预检查失败不应调用判断模型
+                resolver = Mock()
+                self.assertEqual("DEFER", self.reconcile(self.candidate(**attrs), resolver).action)
+                resolver.resolve.assert_not_called()
+        self.assertEqual(1, self.repository.get(original.id).version)
+
+    # 验证模型建议不能越过明确修改意图与工具证据限制
+    def test_update_requires_explicit_user_intent(self):
+        # original：用于模型更新建议的旧记忆
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        # resolver：模拟过于激进的更新建议
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="UPDATE", target_id=original.id, reason="候选值不同",
+        )))
+        self.assertEqual("DEFER", self.reconcile(self.candidate(change_intent="unspecified"), resolver).action)
+        # candidate：工具事实只能新增，不能代替用户授权覆盖偏好
+        candidate = self.candidate(source_kind="tool")
+        self.assertEqual("DEFER", MemoryReconciler(self.service, resolver).reconcile(
+            self.memory_write(candidate.content, candidate.memory_key), candidate,
+            "以后文案最多80字", [candidate.evidence],
+        ).action)
+        self.assertEqual(1, self.repository.get(original.id).version)
+
+    # 验证返回陌生 ID 或其他用户、租户、项目的 ID 时只能暂缓
+    def test_foreign_targets_cannot_be_updated(self):
+        self.service.remember(self.memory_write("文案最多45字", "local"))
+        # attrs：三个独立隔离边界
+        for attrs in ({"tenant_id": "other"}, {"user_id": "other"}, {"project_id": "other"}):
+            with self.subTest(attrs=attrs):
+                # foreign：位于不同身份或项目范围的旧记忆
+                foreign = self.service.remember(self.memory_write("他人的记忆", "foreign").model_copy(update=attrs))
+                # resolver：模拟返回越界目标的错误模型
+                resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+                    action="UPDATE", target_id=foreign.id, reason="错误目标",
+                )))
+                self.assertEqual("DEFER", self.reconcile(self.candidate(), resolver).action)
+                self.assertEqual(1, self.repository.get(foreign.id).version)
+
+    # 验证 ADD 不能通过相同稳定键绕过 UPDATE 的明确授权要求
+    def test_add_cannot_silently_overwrite_key(self):
+        # original：与候选同键但内容不同
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        # resolver：模拟错误的新增决策
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(action="ADD", reason="新增")))
+        self.assertEqual("DEFER", self.reconcile(self.candidate(), resolver).action)
+        self.assertEqual(1, self.repository.get(original.id).version)
+
+    # 验证模型判断期间的并发更新不会被过期决策覆盖
+    def test_concurrent_update_defers_stale_decision(self):
+        # original：最初读取到的旧记忆
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+
+        # 在模型返回前模拟另一个会话写入新版本
+        # args：判断器接收的候选、旧记忆和原文
+        def decide(*args):
+            self.service.remember(self.memory_write("文案最多100字", "copy_limit"))
+            return MemoryDecision(action="UPDATE", target_id=original.id, reason="修改到80字")
+
+        # resolver：通过回调复现模型请求期间的并发交错
+        resolver = Mock(resolve=Mock(side_effect=decide))
+        self.assertEqual("DEFER", self.reconcile(self.candidate(), resolver).action)
+        self.assertEqual("文案最多100字", self.repository.get(original.id).content)
+
+    # 验证判断器失败会被记录为暂缓，不会修改记忆或创建同步任务
+    def test_resolver_failure_is_audited_as_defer(self):
+        self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        # resolver：模拟模型超时
+        resolver = Mock(resolve=Mock(side_effect=TimeoutError("请求超时")))
+        self.assertEqual("DEFER", self.reconcile(self.candidate(), resolver).action)
+        with self.repository._connect() as connection:
+            self.assertEqual("DEFER", connection.execute("SELECT action FROM memory_decisions").fetchone()[0])
+        self.assertEqual(1, len(self.repository.list_jobs()))
+
+    # 验证 Outbox 创建失败时正文、历史和决策全部回滚
+    def test_update_transaction_rolls_back_on_outbox_failure(self):
+        # original：应在失败后完整保留的旧记忆
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        # resolver：合法更新决策
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="UPDATE", target_id=original.id, reason="明确更新",
+        )))
+        with patch.object(self.repository, "_insert_job", side_effect=RuntimeError("写入失败")):
+            with self.assertRaises(RuntimeError):
+                self.reconcile(self.candidate(), resolver)
+        self.assertEqual("文案最多45字", self.repository.get(original.id).content)
+        with self.repository._connect() as connection:
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM memory_versions").fetchone()[0])
+            self.assertEqual(0, connection.execute("SELECT count(*) FROM memory_decisions").fetchone()[0])
+
+    # 验证大范围语义检索失败时不能被当成没有旧记忆而新增
+    def test_semantic_search_failure_defers_candidate(self):
+        # index：创建足够多的旧记忆进入语义检索路径
+        for index in range(17):
+            self.service.remember(self.memory_write(f"旧事实{index}", f"key_{index}"))
+        self.service.process_pending()
+        self.service.process_pending()
+        with patch.object(self.service, "recall", side_effect=ConnectionError("Qdrant不可用")):
+            self.assertEqual("DEFER", self.reconcile(self.candidate(), Mock()).action)
+
+    # 验证大范围检索合并未索引旧记忆，且严格限制项目
+    def test_pending_memory_included_in_semantic_context(self):
+        # index：已索引的旧记忆，触发语义搜索路径
+        for index in range(17):
+            self.service.remember(self.memory_write(f"旧事实{index}", f"key_{index}"))
+        self.service.process_pending()
+        self.service.process_pending()
+        # pending：刚写入但还没有向量，必须交给判断模型
+        pending = self.service.remember(self.memory_write("文案上限45字", "old_limit"))
+        # resolver：新旧键不同也可以基于待索引正文识别冲突
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="UPDATE", target_id=pending.id, reason="用户明确更新",
+        )))
+        self.assertEqual("UPDATE", self.reconcile(self.candidate(), resolver).action)
+        self.assertIn(pending.id, [item.id for item in resolver.resolve.call_args.args[1]])
+        self.assertTrue(self.index.search_args[3]["exact_project"])
+
+    # 验证已领取的旧版本任务在新正文提交后不会向索引写入过期内容
+    def test_claimed_old_job_skips_after_memory_update(self):
+        # original：待索引旧记忆；job：模拟旧 Worker 已领取的任务
+        original = self.service.remember(self.memory_write("文案最多45字", "copy_limit"))
+        job = self.repository.claim_jobs()[0]
+        # resolver：当前轮次生成有效更新
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(
+            action="UPDATE", target_id=original.id, reason="明确更新",
+        )))
+        self.assertEqual("UPDATE", self.reconcile(self.candidate(), resolver).action)
+        self.assertEqual(IndexJobStatus.SUPERSEDED, self.service._process_job(job))
+        self.assertEqual([], self.index.upserts)
+        self.assertEqual(1, self.service.process_pending().completed)
+        self.assertEqual("文案最多80字", self.index.upserts[-1][0].content)
+
     # 验证 Worker 成功生成向量、写入索引并更新 SQLite 状态
     def test_process_pending_indexes_memory(self):
         memory = self.service.remember(self.memory_write())
@@ -363,7 +585,7 @@ class MemoryServiceTest(unittest.TestCase):
         # 测试中使用替身 Qdrant，需要先模拟两个 SQLite 版本已经完成索引
         self.service.process_pending()
 
-        recalled = self.service.recall("我喜欢怎样的解释", "tenant-1", "user-1")
+        recalled = self.service.recall("我喜欢怎样的解释", "tenant-1", "user-1", project_id="agent-study")
 
         self.assertEqual([(allowed.id, 0.80)], [(item.id, score) for item, score in recalled])
         self.assertEqual("tenant-1", self.index.search_args[1])
@@ -429,6 +651,9 @@ class MemoryServiceTest(unittest.TestCase):
                         content="项目长期记忆使用 SQLite 保存文本并使用 Qdrant 保存向量。",
                         importance=0.9,
                         confidence=1.0,
+                        evidence="长期记忆使用 SQLite 保存文本并使用 Qdrant 保存向量",
+                        source_kind="user",
+                        change_intent="new",
                     )
                 ]
             )
@@ -438,12 +663,13 @@ class MemoryServiceTest(unittest.TestCase):
             [AIMessage(content="已经确认长期记忆方案。", id="assistant-final")],
             memory_service=self.service,
             memory_extractor=extractor,
+            memory_resolver=Mock(resolve=Mock(return_value=MemoryDecision(action="ADD", reason="新增存储决策"))),
             tenant_id="tenant-1",
             user_id="user-1",
             project_id="agent-study",
         )
 
-        answer = agent.run("继续完善长期记忆")
+        answer = agent.run("长期记忆使用 SQLite 保存文本并使用 Qdrant 保存向量")
 
         self.assertEqual("已经确认长期记忆方案。", answer)
         # memory_messages：只注入本次模型输入的临时长期记忆系统消息

@@ -194,6 +194,7 @@ class LongTermMemoryService:
     # memory_types：允许召回的记忆类型
     # limit：最多召回的记忆数量
     # score_threshold：最低语义相关度
+    # exact_project：冲突判断只查当前项目，不混入用户级全局记忆
     def recall(
         self,
         query,
@@ -203,6 +204,7 @@ class LongTermMemoryService:
         memory_types=None,
         limit=8,
         score_threshold=None,
+        exact_project=False,
     ):
         # 没有已索引记忆时跳过模型加载与 Qdrant 请求
         if not self.repository.has_indexed_memories(tenant_id, user_id):
@@ -218,6 +220,7 @@ class LongTermMemoryService:
             memory_types=memory_types,
             limit=limit,
             score_threshold=score_threshold,
+            exact_project=exact_project,
         )
         # memories：按 Qdrant 相关度顺序批量加载的 SQLite 完整记忆
         memories = self.repository.get_many(
@@ -227,5 +230,7 @@ class LongTermMemoryService:
         )
         # scores：用于将相关度与完整记忆重新组合的分数映射
         scores = {hit.memory_id: hit.score for hit in hits}
-        return [(memory, scores[memory.id]) for memory in memories]
+        return [(memory, scores[memory.id]) for memory in memories
+                if memory.project_id == project_id
+                or (not exact_project and memory.project_id is None)]
 

@@ -155,6 +155,43 @@ uv run python -m agent.memory.worker
 `AGENT_EMBEDDING_API_KEY`。每个新用户轮次开始时只召回一次长期记忆，最终答案
 生成后只提取一次候选记忆；召回和提取失败不会终止主任务。
 
+### 记忆冲突与更新
+
+自动提取的候选先经过 `MemoryReconciler`，不再直接按键覆盖：
+
+1. 提取原子事实、原文证据、来源、长期/临时范围和修改意图。
+2. 完全重复直接 `NOOP`；临时要求、缺少用户或工具原文依据的候选 `DEFER`。
+3. 同租户、用户、精确项目范围内匹配旧记忆。最多 16 条时直接比较全部；更多时合并
+   精确键、全部未索引记录和 Qdrant 前 8 条语义结果。超过 32 条或正文总量 24000 字符时暂缓。
+4. 独立的 DeepSeek `MemoryConflictResolver` 返回 `ADD / NOOP / UPDATE / DEFER`。
+   提取器和判断器各自关闭 thinking，主 Agent 配置不变；判断器失败或检索失败会暂缓保存。
+5. 程序核对目标 ID、证据和明确修改意图；提交事务时再核对范围快照的 ID 与版本。
+   并发变化时暂缓，避免旧决策覆盖新事实。ADD 不允许隐式覆盖已占用的稳定键。
+6. UPDATE 保持旧 ID、类型和稳定键，旧记录归档到 `memory_versions`，正文、历史、
+   `memory_decisions` 审计与 Outbox 一起提交。Worker 复用现有版本化索引同步。
+
+`MemoryConflictResolver.resolve(candidate, memories, user_message)` 是供应商适配边界；
+后续 Jev 可返回同一个 `MemoryDecision`，不必改数据库事务与权限检查。
+`LongTermMemoryService.remember()` 保留为可信程序写入接口；自动提取必须走上述判断管线。
+
+数据库启动时自动创建新增表，不改写已有记忆，也不会补齐更早版本的历史。
+`DEFER` 仅保存候选与原因，不进入召回、不自动重放。新的明确用户表达可在后续轮次重新判断。
+语义判断仍取决于模型和检索质量，证据片段检查只验证来源存在，不等于证明内容理解绝对正确。
+当前范围快照从 SQLite 读取完整有效记录，适合学习项目规模；后续大量记忆时可优化为范围修订号与分页候选查询。
+
+在 DBeaver 中可以查看决策和旧版本：
+
+```sql
+SELECT action, reason, target_id, candidate_json, created_at
+FROM memory_decisions ORDER BY created_at DESC LIMIT 20;
+
+SELECT memory_id, version, snapshot_json, archived_at
+FROM memory_versions ORDER BY archived_at DESC LIMIT 20;
+```
+
+手工验证：先记住“文案最多45字”，再表达“以后改为80字”，检查原记录 ID 不变、版本递增、
+历史表保留45字、Worker 索引新版本；重复表达80字不应新增版本；“仅本次允许100字”不应覆盖长期默认值。
+
 先编辑项目根目录的 `.env`，将占位符替换成自己的真实 DeepSeek API Key：
 
 ```dotenv

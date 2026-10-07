@@ -23,6 +23,12 @@ MEMORY_EXTRACTION_SYSTEM = """
 6. preference、fact、decision 应提供稳定、简短的英文 snake_case memory_key。
 7. episodic、semantic、document_summary 在没有自然稳定键时可以不提供 memory_key。
 8. 用户明确说“记住”或“以后都要”时，importance 至少为 0.9、confidence 为 1.0。
+9. 将品牌名、主营产品、字数限制等拆成独立原子事实，一条候选只表达一个可独立更新的事实。
+10. evidence 必须引用来源中的连续原文；source_kind 标明 user、tool 或 assistant。
+    不得将助手复述的旧记忆、猜测或承诺伪装为用户新表达的事实。
+11. change_intent 仅在用户明确要求修改长期事实时为 update，新事实为 new，其余为 unspecified。
+12. “仅本次”“这一次”等临时要求标记 scope_kind=temporary，不得覆盖长期默认偏好。
+13. 只询问、回顾已有记忆且没有新事实或修改时，返回空 candidates；不要重复提取助手的复述。
 """.strip()
 
 

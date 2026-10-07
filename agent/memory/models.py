@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -163,9 +164,28 @@ class MemoryCandidate(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     # expires_at：具有明显时效性的记忆过期时间
     expires_at: datetime | None = None
+    # evidence：来自指定来源的连续原文片段，程序验证其确实存在
+    evidence: str = Field(default="", max_length=4000)
+    # source_kind：候选依据的来源，助手总结不能单独授权覆盖用户偏好
+    source_kind: Literal["user", "tool", "assistant"] = "assistant"
+    # change_intent：用户是否明确表达修改长期事实的意图
+    change_intent: Literal["new", "update", "unspecified"] = "unspecified"
+    # scope_kind：候选适用于长期还是仅限当前任务
+    scope_kind: Literal["long_term", "temporary"] = "long_term"
 
 
 class MemoryExtractionBatch(BaseModel):
     # candidates：当前用户轮次提取的有限候选记忆
     candidates: list[MemoryCandidate] = Field(default_factory=list, max_length=5)
+
+
+class MemoryDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # action：新增、重复跳过、更新或暂缓保存
+    action: Literal["ADD", "NOOP", "UPDATE", "DEFER"]
+    # target_id：重复或更新对应的既有记忆标识，必须来自提供的候选列表
+    target_id: str | None = None
+    # reason：用于中文日志和审计的简短判断依据
+    reason: str = Field(min_length=1, max_length=500)
 

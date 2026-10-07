@@ -17,6 +17,8 @@ from agent.config import load_env
 from agent.context import ContextManager
 from agent.memory.extractor import StructuredMemoryExtractor
 from agent.memory.models import MemoryWrite
+from agent.memory.reconciliation import MemoryReconciler
+from agent.memory.resolver import MemoryConflictResolver
 from agent.summarizer import ResultSummarizer
 from tooling.executor import ToolExecutor
 from tooling.registry import ObservationPolicy, format_tool_action, get_tool_schemas
@@ -109,6 +111,7 @@ class Agent:
     # checkpointer：测试或扩展时注入的 LangGraph Checkpointer
     # memory_service：可选的长期记忆存储、索引与召回服务
     # memory_extractor：测试或扩展时注入的结构化记忆提取器
+    # memory_resolver：测试或更换供应商时注入的记忆冲突判断器
     # tenant_id：本地运行时默认租户标识
     # user_id：本地运行时默认用户标识
     # project_id：本地运行时默认项目标识
@@ -149,6 +152,7 @@ class Agent:
         memory_extraction_max_chars=None,
         memory_min_importance=None,
         memory_min_confidence=None,
+        memory_resolver=None,
     ):
         if type(max_model_recoveries) is not int or max_model_recoveries < 0:
             raise ValueError("max_model_recoveries 必须是非负整数")
@@ -286,6 +290,8 @@ class Agent:
         self.memory_service = memory_service
         # memory_extractor：首次需要提取时才基于原始 ChatModel 创建
         self.memory_extractor = memory_extractor
+        # memory_resolver：首次处理候选时延迟创建独立 DeepSeek 判断器
+        self.memory_resolver = memory_resolver
         # tenant_id：命令行本地环境使用的默认租户边界
         self.tenant_id = tenant_id or os.getenv("AGENT_TENANT_ID", "local")
         # user_id：命令行本地环境使用的默认用户边界
@@ -347,6 +353,12 @@ class Agent:
         if self.memory_extractor is None:
             self.memory_extractor = StructuredMemoryExtractor(self._get_chat_model())
         return self.memory_extractor
+
+    # 延迟创建记忆判断器，独立配置避免影响主 Agent 的 thinking
+    def _get_memory_resolver(self):
+        if self.memory_resolver is None:
+            self.memory_resolver = MemoryConflictResolver(self._get_chat_model())
+        return self.memory_resolver
 
     # 使用 LangChain ChatModel 调用模型并返回标准 AIMessage
     # messages：LangGraph 状态中维护的标准消息列表
@@ -567,21 +579,25 @@ class Agent:
 
         try:
             logger.info("🧠 正在提取本轮长期记忆...")
+            # observations：本轮提取与来源验证使用同一份受限工具证据
+            observations = self._current_turn_observations(state)
             # extraction：结构化输出校验后的候选记忆批次
             extraction = self._get_memory_extractor().extract(
                 user_message=state["goal"],
                 final_answer=final_answer,
-                tool_observations=self._current_turn_observations(state),
+                tool_observations=observations,
             )
             # stored_count：通过程序规则并成功写入 SQLite 的记忆数量
             stored_count = 0
+            # counts：区分新增、更新、重复与暂缓，避免将重复处理显示为新增
+            counts = {"ADD": 0, "UPDATE": 0, "NOOP": 0, "DEFER": 0}
             # candidate：当前正在执行程序审核的候选记忆
             for index, candidate in enumerate(extraction.candidates):
                 if candidate.importance < self.memory_min_importance:
                     continue
                 if candidate.confidence < self.memory_min_confidence:
                     continue
-                if self._contains_sensitive_credential(candidate.content):
+                if self._contains_sensitive_credential(candidate.content + "\n" + candidate.evidence):
                     logger.warning("🛡️ 已拒绝包含疑似凭据的长期记忆候选")
                     continue
                 # memory_key：无稳定键的候选使用轮次下标保证重试幂等
@@ -592,24 +608,32 @@ class Agent:
                 source_message_ids = [state["turn_user_message_id"]]
                 if final_message.id:
                     source_message_ids.append(final_message.id)
-                self.memory_service.remember(
-                    MemoryWrite(
-                        tenant_id=state["tenant_id"],
-                        user_id=state["user_id"],
-                        project_id=state.get("project_id"),
-                        memory_type=candidate.memory_type,
-                        memory_key=memory_key,
-                        content=candidate.content,
-                        importance=candidate.importance,
-                        confidence=candidate.confidence,
-                        source_thread_id=state["thread_id"],
-                        source_message_ids=source_message_ids,
-                        expires_at=candidate.expires_at,
-                    )
+                # value：身份和项目范围由程序状态提供，不接受模型指定
+                value = MemoryWrite(
+                    tenant_id=state["tenant_id"],
+                    user_id=state["user_id"],
+                    project_id=state.get("project_id"),
+                    memory_type=candidate.memory_type,
+                    memory_key=memory_key,
+                    content=candidate.content,
+                    importance=candidate.importance,
+                    confidence=candidate.confidence,
+                    source_thread_id=state["thread_id"],
+                    source_message_ids=source_message_ids,
+                    expires_at=candidate.expires_at,
                 )
-                stored_count += 1
+                # reconciler：判断器只提出动作，程序控制证据、范围和版本检查
+                reconciler = MemoryReconciler(self.memory_service, self._get_memory_resolver())
+                # decision：事务执行后的真实动作，包括并发冲突导致的暂缓
+                decision = reconciler.reconcile(value, candidate, state["goal"], observations)
+                counts[decision.action] += 1
+                if decision.action in {"ADD", "UPDATE"}:
+                    stored_count += 1
             self.memory_service.complete_extraction(state["turn_id"], stored_count)
-            logger.info("✅ 本轮长期记忆提取完成: 写入 %d 条", stored_count)
+            logger.info(
+                "✅ 记忆处理完成：新增 %d，更新 %d，重复跳过 %d，暂缓 %d",
+                counts["ADD"], counts["UPDATE"], counts["NOOP"], counts["DEFER"],
+            )
         except Exception as error:
             self.memory_service.fail_extraction(state["turn_id"], error)
             logger.warning("⚠️ 长期记忆提取失败，不影响本轮答案：%s", error)

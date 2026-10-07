@@ -2,7 +2,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from agent.memory.models import (
     MemoryIndexJob,
     MemoryStatus,
     MemoryWrite,
+    MemoryDecision,
 )
 
 
@@ -89,6 +90,27 @@ CREATE TABLE IF NOT EXISTS memory_extraction_runs (
 
 CREATE INDEX IF NOT EXISTS idx_memory_extraction_status
 ON memory_extraction_runs(status, locked_until, updated_at);
+
+CREATE TABLE IF NOT EXISTS memory_versions (
+    memory_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    PRIMARY KEY(memory_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS memory_decisions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    project_id TEXT,
+    source_thread_id TEXT,
+    candidate_json TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_id TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -231,7 +253,8 @@ class MemoryRepository:
     # 新建记忆，或按稳定 memory_key 更新当前有效记忆
     # value：经过 Pydantic 校验的记忆写入请求
     # embedding_model：该记忆准备使用的向量模型
-    def upsert(self, value, embedding_model):
+    # connection：内部复用的事务连接；target_id：已经通过边界检查的精确更新目标
+    def upsert(self, value, embedding_model, connection=None, target_id=None):
         if not isinstance(value, MemoryWrite):
             value = MemoryWrite.model_validate(value)
         if not isinstance(embedding_model, str) or not embedding_model.strip():
@@ -243,11 +266,22 @@ class MemoryRepository:
         project_scope = value.project_id or ""
         # content_hash：用于识别记忆文本版本的 SHA-256
         content_hash = self._content_hash(value.content)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        # owns_transaction：仅独立调用时自行启动事务
+        owns_transaction = connection is None
+        with self._connect() if owns_transaction else nullcontext(connection) as connection:
+            if owns_transaction:
+                connection.execute("BEGIN IMMEDIATE")
             # existing：具有相同稳定键的当前有效记忆
             existing = None
-            if value.memory_key is not None:
+            if target_id is not None:
+                existing = connection.execute(
+                    """SELECT * FROM memories WHERE id = ? AND tenant_id = ?
+                    AND user_id = ? AND project_scope = ? AND status = 'active'""",
+                    (target_id, value.tenant_id, value.user_id, project_scope),
+                ).fetchone()
+                if existing is None:
+                    raise ValueError("记忆更新目标不在当前有效范围内")
+            elif value.memory_key is not None:
                 existing = connection.execute(
                     """
                     SELECT * FROM memories
@@ -263,6 +297,12 @@ class MemoryRepository:
                         MemoryStatus.ACTIVE.value,
                     ),
                 ).fetchone()
+
+            # 内容、生命周期和向量模型均未变化时不增加版本、不创建重复任务
+            if (existing is not None and existing["content_hash"] == content_hash
+                    and existing["expires_at"] == self._serialize_datetime(value.expires_at)
+                    and existing["embedding_model"] == embedding_model.strip()):
+                return self._memory_from_row(existing)
 
             if existing is None:
                 # memory_id：SQLite 和 Qdrant 共用的新记忆标识
@@ -305,6 +345,12 @@ class MemoryRepository:
             else:
                 memory_id = existing["id"]
                 memory_version = existing["version"] + 1
+                # 在更新正文前保存完整旧版本，与正文及 Outbox 同事务提交
+                connection.execute(
+                    "INSERT INTO memory_versions VALUES (?, ?, ?, ?)",
+                    (memory_id, existing["version"], json.dumps(dict(existing), ensure_ascii=False),
+                     self._serialize_datetime(now)),
+                )
                 connection.execute(
                     """
                     UPDATE memories
@@ -356,8 +402,64 @@ class MemoryRepository:
                 "SELECT * FROM memories WHERE id = ?",
                 (memory_id,),
             ).fetchone()
-            connection.commit()
         return self._memory_from_row(row)
+
+    # 读取指定范围的当前有效记忆，包含尚未生成向量的记录
+    # value：可信租户、用户与项目；connection：可选的当前事务连接
+    def conflict_snapshot(self, value, connection=None):
+        with self._connect() if connection is None else nullcontext(connection) as connection:
+            # rows：按 ID 排序确保并发快照比较稳定，不限制类型以发现跨类型重复
+            rows = connection.execute(
+                """SELECT * FROM memories WHERE tenant_id = ? AND user_id = ?
+                AND project_scope = ? AND status = 'active'
+                AND (expires_at IS NULL OR expires_at > ?) ORDER BY id""",
+                (value.tenant_id, value.user_id, value.project_id or "",
+                 self._serialize_datetime(self._now())),
+            ).fetchall()
+        return [self._memory_from_row(row) for row in rows]
+
+    # 原子提交冲突决策，重新校验作用域、目标版本及新增时的键冲突
+    # value：待保存正文；candidate：候选证据；decision：经过程序审核的决策
+    # snapshot：判断前的范围快照；embedding_model：当前向量模型
+    def apply_decision(self, value, candidate, decision, snapshot, embedding_model):
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # current：事务内重读，防止模型判断期间其他会话修改记忆
+            current = self.conflict_snapshot(value, connection)
+            if decision.action != "DEFER" and (
+                [(item.id, item.version) for item in current]
+                != [(item.id, item.version) for item in snapshot]
+            ):
+                decision = MemoryDecision(action="DEFER", reason="记忆版本已变化，请在后续轮次重新判断")
+            # target：仅允许更新或引用当前可信范围中的记忆
+            target = next((item for item in current if item.id == decision.target_id), None)
+            if decision.action in {"UPDATE", "NOOP"} and target is None:
+                decision = MemoryDecision(action="DEFER", reason="目标记忆不在当前有效范围内")
+            if decision.action == "ADD" and value.memory_key is not None:
+                # active_key：过期记录也可能占用旧唯一键，不得借新增隐式覆盖
+                active_key = connection.execute(
+                    """SELECT id FROM memories WHERE tenant_id=? AND user_id=?
+                    AND project_scope=? AND memory_type=? AND memory_key=? AND status='active'""",
+                    (value.tenant_id, value.user_id, value.project_id or "",
+                     value.memory_type.value, value.memory_key),
+                ).fetchone()
+                if active_key is not None:
+                    decision = MemoryDecision(action="DEFER", reason="新增候选占用已有稳定键，禁止隐式覆盖")
+            if decision.action in {"ADD", "UPDATE"}:
+                # stored：保存候选原文，模型不能自行改写数据库正文
+                stored = self.upsert(
+                    value, embedding_model, connection,
+                    target_id=decision.target_id if decision.action == "UPDATE" else None,
+                )
+                decision = decision.model_copy(update={"target_id": stored.id})
+            # 决策及候选保留供排查，DEFER 不会进入向量索引，也不会自动重放
+            connection.execute(
+                "INSERT INTO memory_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), value.tenant_id, value.user_id, value.project_id,
+                 value.source_thread_id, candidate.model_dump_json(), decision.action,
+                 decision.target_id, decision.reason, self._serialize_datetime(self._now())),
+            )
+        return decision
 
     # 按标识读取一条长期记忆
     # memory_id：记忆唯一标识
