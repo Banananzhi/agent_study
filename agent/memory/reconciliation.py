@@ -39,7 +39,8 @@ class MemoryReconciler:
         if candidate.scope_kind == "temporary":
             return MemoryDecision(action="DEFER", reason="仅限当前任务，不更新长期默认值")
         # duplicate：完全相同正文及有效期无需调用判断模型或再次生成向量
-        duplicate = next((item for item in snapshot
+        # 重新授权后优先复用较新的相同事实，避免多条旧残留导致再次新增
+        duplicate = next((item for item in sorted(snapshot, key=lambda memory: memory.source_seq, reverse=True)
                           if item.content == value.content and item.expires_at == value.expires_at), None)
         if duplicate is not None:
             return MemoryDecision(action="NOOP", target_id=duplicate.id, reason="已有相同正文与有效期")

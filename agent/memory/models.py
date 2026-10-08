@@ -64,6 +64,12 @@ class MemoryWrite(BaseModel):
     source_message_ids: list[str] = Field(default_factory=list)
     # expires_at：记忆过期时间，None 表示长期有效
     expires_at: datetime | None = None
+    # source_seq：用户原始轮次序号，0 表示迁移前未知旧来源
+    source_seq: int = Field(default=0, ge=0)
+    # forget_seq：本次写入门禁已检查的遗忘版本，仅用于提交验证
+    forget_seq: int = Field(default=0, ge=0)
+    # relearn_after_seq：明确重新授权对应的遗忘序号，防止沿用遗漏的旧 ID
+    relearn_after_seq: int = Field(default=0, ge=0)
 
     # 校验来源消息标识不包含空值并保持顺序去重
     # value：待校验的来源消息标识列表

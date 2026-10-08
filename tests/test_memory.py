@@ -5,7 +5,8 @@ from unittest.mock import Mock, patch
 from pathlib import Path
 
 import httpx
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain_deepseek import ChatDeepSeek
 from qdrant_client import QdrantClient
 
@@ -14,6 +15,10 @@ from agent.memory.extractor import StructuredMemoryExtractor
 from agent.memory.models import MemoryDecision
 from agent.memory.reconciliation import MemoryReconciler
 from agent.memory.resolver import MemoryConflictResolver
+from agent.memory.forgetting import (
+    MemoryForgetService, MemoryWriteGate, ContextForgetSanitizer,
+    ForgetSelection, ForgetMatch, Redaction, ForgetJudge,
+)
 from agent.memory import (
     IndexJobStatus,
     IndexStatus,
@@ -41,9 +46,12 @@ class StructuredMemoryExtractorTest(unittest.TestCase):
         def handler(request):
             captured.append(json.loads(request.content))
             # result：根据绑定的 Schema 返回对应结构，覆盖提取器与判断器
-            result = (MemoryDecision(action="DEFER", reason="测试判断结果")
-                      if captured[-1]["tools"][0]["function"]["name"] == "MemoryDecision"
-                      else MemoryExtractionBatch())
+            result = {
+                "MemoryDecision": MemoryDecision(action="DEFER", reason="测试判断结果"),
+                "ForgetSelection": ForgetSelection(authorized=True, ambiguous=False, topic="字数", evidence="忘记字数"),
+                "ForgetMatch": ForgetMatch(matches=True, relearn=False),
+                "Redaction": Redaction(related=True, spans=[]),
+            }.get(captured[-1]["tools"][0]["function"]["name"], MemoryExtractionBatch())
             return httpx.Response(200, json={
                 "id": "test-extraction",
                 "object": "chat.completion",
@@ -87,19 +95,28 @@ class StructuredMemoryExtractorTest(unittest.TestCase):
                 captured[0]["tool_choice"],
             )
             self.assertEqual({"type": "enabled"}, model.extra_body["thinking"])
+
+            # judge：遗忘的三个结构化接口都应使用独立非 thinking 请求
+            judge = ForgetJudge(model)
+            self.assertTrue(judge.select("忘记字数", "字数", []).authorized)
+            self.assertTrue(judge.match("字数", "45字", "").matches)
+            self.assertTrue(judge.redact(["字数"], "45字").related)
+            for request in captured[-3:]:
+                self.assertEqual({"type": "disabled"}, request["thinking"])
+            self.assertEqual({"type": "enabled"}, model.extra_body["thinking"])
             # 再次通过主模型发送请求，确认 HTTP 层仍使用原有推理配置
             model.bind_tools([MemoryExtractionBatch], tool_choice="auto").invoke("你好")
-            self.assertEqual({"type": "enabled"}, captured[1]["thinking"])
-            self.assertEqual("auto", captured[1]["tool_choice"])
+            self.assertEqual({"type": "enabled"}, captured[-1]["thinking"])
+            self.assertEqual("auto", captured[-1]["tool_choice"])
             # resolver：同样禁用 thinking，且请求携带候选和来源原文
             resolver = MemoryConflictResolver(model)
             # candidate：仅用于验证判断请求编码与结构化解析
             candidate = MemoryCandidate(content="偏好短文案", memory_type="preference",
                                         importance=0.9, confidence=1.0)
             self.assertEqual("DEFER", resolver.resolve(candidate, [], "测试原文").action)
-            self.assertEqual({"type": "disabled"}, captured[2]["thinking"])
-            self.assertEqual("MemoryDecision", captured[2]["tool_choice"]["function"]["name"])
-            self.assertIn("测试原文", captured[2]["messages"][-1]["content"])
+            self.assertEqual({"type": "disabled"}, captured[-1]["thinking"])
+            self.assertEqual("MemoryDecision", captured[-1]["tool_choice"]["function"]["name"])
+            self.assertIn("测试原文", captured[-1]["messages"][-1]["content"])
             self.assertEqual({"type": "enabled"}, model.extra_body["thinking"])
 
 
@@ -753,6 +770,326 @@ class QdrantMemoryIndexTest(unittest.TestCase):
 
         self.assertEqual([memory.id], [hit.memory_id for hit in allowed])
         self.assertEqual([], blocked)
+
+
+class ForgetJudgeFake:
+    # 模拟确定性的字数限制语义判断，测试无需联网
+    def __init__(self):
+        self.ambiguous = False
+
+    # user：当前原文；query：查询；memories：可选目标
+    def select(self, user, query, memories):
+        return ForgetSelection(authorized="忘记" in user, ambiguous=self.ambiguous,
+                               topic="文案字数限制", evidence=user,
+                               ids=[item.id for item in memories if "字" in item.content])
+
+    # topic：主题；content：候选；user：新的原文
+    def match(self, topic, content, user):
+        return ForgetMatch(matches="字" in content, relearn="以后" in user, evidence=user)
+
+    # topics：主题；text：原始内容，定位连续旧值
+    def redact(self, topics, text):
+        return Redaction(related="45字" in text, spans=["文案最多45字"] if "文案最多45字" in text else [])
+
+
+class ForgetMemoryTests(unittest.TestCase):
+    # 创建隔离的数据库、索引替身和可信轮次
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repository = MemoryRepository(Path(self.temp_dir.name) / "memory.sqlite3")
+        self.index = FakeMemoryIndex()
+        self.service = LongTermMemoryService(self.repository, FakeEmbedder(), self.index)
+        self.judge = ForgetJudgeFake()
+        self.scope = {"tenant_id": "t", "user_id": "u", "project_id": "p"}
+        self.old_seq = self.repository.register_memory_turn(self.scope, "old")
+        self.value = MemoryWrite(**self.scope, content="文案最多45字", memory_type="preference",
+                                 memory_key="copy_limit", source_seq=self.old_seq)
+        self.old = self.service.remember(self.value)
+        self.state = {**self.scope, "turn_id": "forget", "goal": "忘记我的文案字数限制"}
+        self.state["source_seq"] = self.repository.register_memory_turn(self.scope, "forget")
+        self.forgetter = MemoryForgetService(self.service, self.judge, self.state)
+
+    # 清理本测试的临时文件
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    # 执行一次正常的搜索及遗忘
+    def forget(self):
+        # result：本轮合法票据
+        result = self.forgetter.search("文案字数限制")
+        return self.forgetter.forget(result["ticket"])
+
+    # 验证软删除、Outbox、原版本归档、遗忘事件及幂等重放
+    def test_forget_is_atomic_and_idempotent(self):
+        # result：本轮可重复消费的授权票据
+        result = self.forgetter.search("字数")
+        first = self.forgetter.forget(result["ticket"])
+        second = self.forgetter.forget(result["ticket"])
+        self.assertEqual(first, second)
+        self.assertEqual("deleted", self.repository.get(self.old.id).status.value)
+        self.assertEqual(1, len(self.repository.forget_events(self.scope)))
+        self.assertEqual(2, len(self.repository.list_jobs(self.old.id)))
+        self.assertEqual([], self.repository.get_many([self.old.id], "t", "u"))
+        self.service.process_pending()
+        self.assertEqual([self.old.id], self.index.deletes)
+        self.assertNotIn("45", first["message"])
+
+    # 验证有歧义不能生成遗忘票据，模型也不能猜造票据
+    def test_ambiguity_and_invalid_ticket_do_not_delete(self):
+        self.judge.ambiguous = True
+        self.assertIsNone(self.forgetter.search("字数")["ticket"])
+        with self.assertRaises(ValueError):
+            self.forgetter.forget("invented")
+        self.assertEqual("active", self.repository.get(self.old.id).status.value)
+
+    # 验证搜索后版本变化时整个遗忘事务拒绝提交
+    def test_stale_target_is_rejected(self):
+        # ticket：基于旧版本生成的授权凭据
+        ticket = self.forgetter.search("字数")["ticket"]
+        self.service.remember(self.value.model_copy(update={"content": "文案最多90字"}))
+        with self.assertRaises(ValueError):
+            self.forgetter.forget(ticket)
+        self.assertEqual([], self.repository.forget_events(self.scope))
+        self.assertEqual("active", self.repository.get(self.old.id).status.value)
+
+    # 验证删除与遗忘事件遇到 Outbox 写入失败时一起回滚
+    def test_forget_rolls_back_if_outbox_fails(self):
+        with patch.object(self.repository, "_insert_job", side_effect=RuntimeError("failed")):
+            with self.assertRaises(RuntimeError):
+                self.forget()
+        self.assertEqual([], self.repository.forget_events(self.scope))
+        self.assertEqual("active", self.repository.get(self.old.id).status.value)
+
+    # 验证不同租户、用户、项目不能删除目标，也看不到该遗忘事件
+    def test_scope_isolation(self):
+        # attrs：逐个测试三个身份边界
+        for attrs in ({"tenant_id": "other"}, {"user_id": "other"}, {"project_id": "other"}):
+            with self.subTest(attrs=attrs):
+                with self.assertRaises(ValueError):
+                    self.repository.commit_forget({**self.scope, **attrs}, "x", "字数", [{"id": self.old.id, "version": 1}])
+        self.forget()
+        for attrs in ({"tenant_id": "other"}, {"user_id": "other"}, {"project_id": "other"}):
+            self.assertEqual([], self.repository.forget_events({**self.scope, **attrs}))
+
+    # 验证上下文独有的信息没有长期 ID 也可以产生遗忘事件
+    def test_context_only_forget(self):
+        # state：另一项目没有长期记忆，只清理其会话上下文
+        state = {**self.state, "project_id": "context-only"}
+        forgetter = MemoryForgetService(self.service, self.judge, state)
+        result = forgetter.search("字数")
+        self.assertEqual([], result["matches"])
+        self.assertIsNotNone(result["ticket"])
+        forgetter.forget(result["ticket"])
+        self.assertEqual(1, len(self.repository.forget_events(state)))
+        self.assertEqual("active", self.repository.get(self.old.id).status.value)
+
+    # 验证门禁阻止旧来源、助手复述和问句，但允许用户明确新长期要求
+    def test_write_gate_and_relearning_creates_new_id(self):
+        self.forget()
+        # gate：写入前的来源检查；candidate：有用户证据的新候选
+        gate = MemoryWriteGate(self.repository, self.judge)
+        candidate = MemoryCandidate(content="文案最多80字", memory_key="copy_limit", memory_type="preference",
+                                    importance=1, confidence=1, source_kind="user", evidence="以后文案最多80字")
+        self.assertFalse(gate.allow(self.value.model_copy(), candidate, "以后文案最多80字"))
+        # value：遗忘后登记的新用户轮次
+        value = self.value.model_copy(update={"content": candidate.content,
+            "source_seq": self.repository.register_memory_turn(self.scope, "new")})
+        self.assertFalse(gate.allow(value, candidate, "我以前的字数限制是什么？"))
+        self.assertFalse(gate.allow(value, candidate.model_copy(update={"source_kind": "assistant"}), "以后文案最多80字"))
+        self.assertTrue(gate.allow(value, candidate, "以后文案最多80字"))
+        # resolver：范围为空直接新增，无需语义冲突判断
+        result = MemoryReconciler(self.service, Mock()).reconcile(value, candidate, "以后文案最多80字", [])
+        self.assertEqual("ADD", result.action)
+        self.assertNotEqual(self.old.id, result.target_id)
+        self.assertEqual("deleted", self.repository.get(self.old.id).status.value)
+        self.assertEqual(value.source_seq, self.repository.get(result.target_id).source_seq)
+        self.assertEqual(1, len(self.repository.forget_events(self.scope)))
+
+    # 验证主题遗忘遗漏的旧 ID 不会经搜索暴露，重新授权时退休旧 ID
+    def test_topic_forget_masks_unselected_old_memory(self):
+        self.repository.commit_forget(self.scope, "topic-only", "字数限制", [])
+        self.assertEqual([], self.forgetter.search("字数")["matches"])
+        # value：用户明确重新建立相同主题的新值
+        value = self.value.model_copy(update={"content": "文案最多80字",
+            "source_seq": self.repository.register_memory_turn(self.scope, "relearn")})
+        candidate = MemoryCandidate(content=value.content, memory_type="preference", memory_key="copy_limit",
+            source_kind="user", evidence="以后文案最多80字", change_intent="update", importance=1, confidence=1)
+        self.assertTrue(MemoryWriteGate(self.repository, self.judge).allow(value, candidate, "以后文案最多80字"))
+        # resolver：识别为旧主题的更新，但存储层会按重新授权创建新 ID
+        resolver = Mock(resolve=Mock(return_value=MemoryDecision(action="UPDATE", target_id=self.old.id, reason="新授权")))
+        result = MemoryReconciler(self.service, resolver).reconcile(value, candidate, "以后文案最多80字", [])
+        self.assertEqual("ADD", result.action)
+        self.assertNotEqual(self.old.id, result.target_id)
+        self.assertEqual("deleted", self.repository.get(self.old.id).status.value)
+
+    # 验证 Qdrant 删除失败时 SQLite 仍阻止回填，Outbox 保留待重试任务
+    def test_qdrant_delete_failure_does_not_restore_recall(self):
+        self.service.process_pending()
+        self.forget()
+        with patch.object(self.index, "delete", side_effect=OSError("Qdrant不可用")):
+            report = self.service.process_pending()
+        self.assertEqual(1, report.retried)
+        self.assertEqual([], self.repository.get_many([self.old.id], "t", "u"))
+
+    # 验证门禁通过之后的新遗忘事件仍会在事务提交时阻止写入
+    def test_new_forget_after_gate_defers_write(self):
+        # candidate：准备写入的新记忆
+        candidate = MemoryCandidate(content="新事实", memory_type="fact", importance=1, confidence=1)
+        self.forget()
+        result = self.repository.apply_decision(self.value, candidate,
+            MemoryDecision(action="ADD", reason="测试"), [], self.service.embedder.model_name)
+        self.assertEqual("DEFER", result.action)
+
+    # 验证普通文本保留无关事实，工具交互整体屏蔽且新来源不受旧事件影响
+    def test_sanitizer_cleans_text_and_tool_pairs(self):
+        self.forget()
+        # events：待清理的遗忘事件；messages：旧轮次和新轮次
+        events = self.repository.forget_events(self.scope)
+        messages = [SystemMessage("系统"), HumanMessage(content="品牌青柚，文案最多45字", id="old"),
+                    AIMessage(content="已记住文案最多45字", id="answer")]
+        sanitized = ContextForgetSanitizer(self.judge).sanitize(messages, events)
+        self.assertNotIn("45字", str(sanitized))
+        self.assertIn("青柚", str(sanitized))
+        # tool_messages：不能单删 ToolMessage 导致调用协议失配
+        tool_messages = [HumanMessage(content="查一下", id="q"), AIMessage(content="", tool_calls=[
+            {"name": "test", "args": {"text": "45字"}, "id": "call"}]),
+            ToolMessage(content="45字", tool_call_id="call")]
+        self.assertEqual(1, len(ContextForgetSanitizer(self.judge).sanitize(tool_messages, events)))
+        # newer：遗忘后的用户新表达不被旧事件屏蔽
+        newer = HumanMessage(content="以后文案最多80字", additional_kwargs={"memory_source_seq": events[-1]["seq"] + 1})
+        self.assertEqual([newer], ContextForgetSanitizer(self.judge).sanitize([newer], events))
+
+    # 验证清理模型失败时保守屏蔽历史轮次
+    def test_sanitizer_failure_does_not_keep_old_input(self):
+        self.forget()
+        # judge：模拟清理服务超时
+        judge = Mock(redact=Mock(side_effect=TimeoutError()))
+        result = ContextForgetSanitizer(judge).sanitize([HumanMessage("文案最多45字")], self.repository.forget_events(self.scope))
+        self.assertNotIn("45字", str(result))
+
+    # 验证旧 Worker 晚到写入会重新安排删除，最终不复活旧向量
+    def test_late_old_worker_requeues_latest_delete(self):
+        # old_job：模拟已经在外部执行的旧任务
+        old_job = self.repository.claim_jobs()[0]
+        self.forget()
+        self.repository.supersede_job(old_job.event_id)
+        self.service.process_pending()
+        self.repository.repair_stale_index(old_job)
+        self.assertEqual("pending", self.repository.get(self.old.id).index_status.value)
+        self.service.process_pending()
+        self.assertEqual(2, len(self.index.deletes))
+
+    # 验证恢复历史会话时清理旧消息与摘要，并阻止跨身份使用 thread_id
+    def test_old_session_resume_cleans_summary_and_messages(self):
+        # checkpointer：无需文件的真实 LangGraph 状态存储
+        checkpointer = InMemorySaver()
+        agent = MemoryScriptedAgent([AIMessage(content="收到"), AIMessage(content="没有旧限制")],
+            memory_service=self.service, memory_extractor=FakeMemoryExtractor(),
+            memory_resolver=Mock(), forget_judge=self.judge, checkpointer=checkpointer,
+            tenant_id="t", user_id="u", project_id="p")
+        agent.run("品牌青柚，文案最多45字", thread_id="thread")
+        # config：向已有会话加入旧摘要，验证恢复时不会继续注入
+        config = {"configurable": {"thread_id": "thread"}}
+        agent.graph.update_state(config, {"session_summary": "文案最多45字", "summary_cursor": "old-cursor"})
+        self.forget()
+        agent.run("我的品牌信息是什么", thread_id="thread")
+        self.assertNotIn("45字", str(agent.seen_messages[-1]))
+        self.assertIn("青柚", str(agent.seen_messages[-1]))
+        self.assertEqual("", agent.graph.get_state(config).values["session_summary"])
+        with self.assertRaises(PermissionError):
+            agent.run("查询", thread_id="thread", user_id="other")
+
+    # 验证真实图、工具执行器、搜索票据、遗忘屏障和跳过提取形成完整闭环
+    def test_agent_tool_forget_end_to_end(self):
+        # extractor：遗忘本轮不应被调用
+        extractor = FakeMemoryExtractor()
+
+        class ForgetAgent(Agent):
+            # 初始化无需真实模型的工具决策序列
+            # attrs：Agent 配置
+            def __init__(self, **attrs):
+                super().__init__(**attrs)
+                self.calls = 0
+                self.last_input = []
+
+            # messages：真实工具执行后返回给模型的上下文
+            def think(self, messages):
+                self.calls += 1
+                self.last_input = messages
+                if self.calls == 1:
+                    return AIMessage(content="", tool_calls=[{"name": "search_memories", "args": {"query": "字数限制"}, "id": "s"}])
+                if self.calls == 2:
+                    # ticket：真实搜索工具刚生成的同轮授权凭据
+                    ticket = next(iter(self.memory_turn.tickets))
+                    return AIMessage(content="", tool_calls=[{"name": "forget_memories", "args": {"ticket": ticket}, "id": "f"}])
+                return AIMessage(content="已处理遗忘，向量删除异步执行。")
+
+        # agent：使用真实执行器和内存检查点，模型只提供预定工具决策
+        agent = ForgetAgent(memory_service=self.service, memory_extractor=extractor,
+                            forget_judge=self.judge, checkpointer=InMemorySaver(),
+                            tenant_id="t", user_id="u", project_id="p")
+        answer = agent.run("忘记我的文案字数限制", thread_id="forget-thread")
+        self.assertIn("已处理遗忘", answer)
+        self.assertNotIn("45字", str(agent.last_input))
+        self.assertEqual([], extractor.calls)
+        self.assertEqual("deleted", self.repository.get(self.old.id).status.value)
+        # saved：最新版 checkpoint 中也不能留有旧正文
+        saved = agent.graph.get_state({"configurable": {"thread_id": "forget-thread"}}).values
+        self.assertNotIn("45字", str(saved["messages"]))
+        self.assertTrue(saved["forgot_this_turn"])
+        self.assertIsNone(agent.memory_turn)
+
+    # 验证模型请求期间出现遗忘，返回的过期工具计划不会被执行
+    def test_forget_during_model_request_discards_plan(self):
+        # agent：think 被测试回调代替
+        agent = Agent(memory_service=self.service, memory_extractor=FakeMemoryExtractor(),
+                      forget_judge=self.judge, tenant_id="t", user_id="u", project_id="p")
+
+        # 在模型请求返回前提交另一个会话的遗忘事件
+        # messages：准备发送给模型的输入
+        def think(messages):
+            self.forget()
+            return AIMessage(content="文案最多45字", tool_calls=[
+                {"name": "calculator", "args": {"expression": "45+1"}, "id": "old-plan"}])
+
+        agent.think = think
+        with patch.object(agent.tool_batch_executor, "execute_batch") as execute:
+            answer = agent.run("根据文案字数限制算一下")
+            execute.assert_not_called()
+        self.assertNotIn("45字", answer)
+        self.assertIn("作废", answer)
+
+    # 验证遗忘发生在附加提取期间时，不向用户交付过期最终答案
+    def test_forget_during_extraction_discards_final_answer(self):
+        # extractor：提取过程中模拟另一个会话完成遗忘
+        extractor = Mock()
+
+        # args：提取材料，遗忘发生在模型已经回答之后
+        def extract(**args):
+            self.forget()
+            return MemoryExtractionBatch()
+
+        extractor.extract.side_effect = extract
+        agent = MemoryScriptedAgent([AIMessage(content="文案最多45字")],
+            memory_service=self.service, memory_extractor=extractor, forget_judge=self.judge,
+            tenant_id="t", user_id="u", project_id="p", checkpointer=InMemorySaver())
+        answer = agent.run("我的字数限制是什么", thread_id="late-forget")
+        self.assertNotIn("45字", answer)
+        self.assertIn("作废", answer)
+
+    # 验证一次遗忘不能和其他工具同时执行，避免同批副作用越过遗忘屏障
+    def test_forget_mixed_batch_rejected(self):
+        agent = MemoryScriptedAgent([
+            AIMessage(content="", tool_calls=[
+                {"name": "forget_memories", "args": {"ticket": "bad"}, "id": "a"},
+                {"name": "calculator", "args": {"expression": "1+1"}, "id": "b"}]),
+            AIMessage(content="需要先明确目标"),
+        ], memory_service=self.service, memory_extractor=FakeMemoryExtractor(), forget_judge=self.judge,
+            tenant_id="t", user_id="u", project_id="p")
+        with patch.object(agent.tool_batch_executor, "execute_batch") as execute:
+            agent.run("忘记字数限制")
+            execute.assert_not_called()
+        self.assertEqual("active", self.repository.get(self.old.id).status.value)
 
 
 if __name__ == "__main__":

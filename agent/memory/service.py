@@ -131,15 +131,18 @@ class LongTermMemoryService:
             self.repository.supersede_job(job.event_id)
             return IndexJobStatus.SUPERSEDED
 
-        if job.operation is IndexOperation.DELETE or memory.status is MemoryStatus.DELETED:
-            self.index.delete(memory.id)
-        else:
-            # vectors：长期记忆正文生成的单条文档向量
-            vectors = self.embedder.embed_documents([memory.content])
-            if len(vectors) != 1 or not vectors[0]:
-                raise ValueError("EmbeddingProvider 必须返回一条非空向量")
-            self.index.upsert(memory, vectors[0])
-
+        try:
+            if job.operation is IndexOperation.DELETE or memory.status is MemoryStatus.DELETED:
+                self.index.delete(memory.id)
+            else:
+                # vectors：长期记忆正文生成的单条文档向量
+                vectors = self.embedder.embed_documents([memory.content])
+                if len(vectors) != 1 or not vectors[0]:
+                    raise ValueError("EmbeddingProvider 必须返回一条非空向量")
+                self.index.upsert(memory, vectors[0])
+        finally:
+            # 远程写入可能成功但响应超时，失败路径也要修复晚到旧版本
+            self.repository.repair_stale_index(job)
         # is_current：同步完成时任务是否仍对应 SQLite 最新版本
         is_current = self.repository.complete_job(job.event_id)
         return IndexJobStatus.COMPLETED if is_current else IndexJobStatus.SUPERSEDED

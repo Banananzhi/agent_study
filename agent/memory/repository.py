@@ -5,6 +5,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from agent.memory.forget_repository import FORGET_SCHEMA, ForgetRepositoryMixin
 
 from agent.memory.models import (
     IndexJobStatus,
@@ -114,7 +115,7 @@ CREATE TABLE IF NOT EXISTS memory_decisions (
 """
 
 
-class MemoryRepository:
+class MemoryRepository(ForgetRepositoryMixin):
     # 初始化长期记忆 SQLite Repository 并创建所需表结构
     # path：SQLite 数据库文件路径
     def __init__(self, path=".agent_data/memories.sqlite3"):
@@ -152,6 +153,12 @@ class MemoryRepository:
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            connection.executescript(FORGET_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            # columns：兼容已有数据库，旧记忆来源序号为 0，按未知旧来源处理
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memories)")}
+            if "source_seq" not in columns:
+                connection.execute("ALTER TABLE memories ADD COLUMN source_seq INTEGER NOT NULL DEFAULT 0")
 
     # 返回统一使用的 UTC 时间
     @staticmethod
@@ -186,6 +193,7 @@ class MemoryRepository:
             project_id=row["project_id"],
             memory_type=row["memory_type"],
             memory_key=row["memory_key"],
+            source_seq=row["source_seq"],
             content=row["content"],
             importance=row["importance"],
             confidence=row["confidence"],
@@ -397,6 +405,7 @@ class MemoryRepository:
                 IndexOperation.UPSERT,
                 now,
             )
+            connection.execute("UPDATE memories SET source_seq=? WHERE id=?", (value.source_seq, memory_id))
             # row：提交前重新读取的完整记忆记录
             row = connection.execute(
                 "SELECT * FROM memories WHERE id = ?",
@@ -424,6 +433,10 @@ class MemoryRepository:
     def apply_decision(self, value, candidate, decision, snapshot, embedding_model):
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # events：提交时复核遗忘版本，拦截模型判断期间新发生的遗忘事件
+            events = self.forget_events(value.model_dump(), connection)
+            if events and events[-1]["seq"] != value.forget_seq:
+                decision = MemoryDecision(action="DEFER", reason="遗忘版本已变化，拒绝使用过期写入决策")
             # current：事务内重读，防止模型判断期间其他会话修改记忆
             current = self.conflict_snapshot(value, connection)
             if decision.action != "DEFER" and (
@@ -435,6 +448,20 @@ class MemoryRepository:
             target = next((item for item in current if item.id == decision.target_id), None)
             if decision.action in {"UPDATE", "NOOP"} and target is None:
                 decision = MemoryDecision(action="DEFER", reason="目标记忆不在当前有效范围内")
+            # 主题遗忘可能覆盖未被精确选中的旧 ID，重新授权时退休旧 ID 而不是复活它
+            if (decision.action in {"UPDATE", "NOOP"} and target is not None
+                    and value.relearn_after_seq > 0 and target.source_seq <= value.relearn_after_seq):
+                # now：退休旧记录的事务时间；row：归档完整旧记录
+                now = self._now()
+                row = connection.execute("SELECT * FROM memories WHERE id=?", (target.id,)).fetchone()
+                connection.execute("INSERT OR IGNORE INTO memory_versions VALUES (?,?,?,?)",
+                    (target.id, target.version, json.dumps(dict(row), ensure_ascii=False), self._serialize_datetime(now)))
+                connection.execute("UPDATE memories SET status='deleted',index_status='pending',version=version+1,updated_at=? WHERE id=?",
+                                   (self._serialize_datetime(now), target.id))
+                connection.execute("UPDATE memory_index_jobs SET status='superseded' WHERE memory_id=? AND status='pending'", (target.id,))
+                self._insert_job(connection, target.id, target.version + 1, IndexOperation.DELETE, now)
+                value = value.model_copy(update={"memory_key": target.memory_key, "memory_type": target.memory_type})
+                decision = MemoryDecision(action="ADD", reason="用户在遗忘后重新授权，使用新记忆 ID")
             if decision.action == "ADD" and value.memory_key is not None:
                 # active_key：过期记录也可能占用旧唯一键，不得借新增隐式覆盖
                 active_key = connection.execute(

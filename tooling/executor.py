@@ -180,6 +180,10 @@ class ToolExecutor:
         for attempt in range(1, policy.max_attempts + 1):
             try:
                 # 4. 使用模型生成的参数执行真正的工具函数
+                # before_execute：Agent 可注入的即时状态检查，每次重试前都执行
+                before_execute = getattr(self, "before_execute", None)
+                if before_execute is not None:
+                    before_execute()
                 value = tool.function(**args)
 
                 # 5. 使用 Pydantic 校验并将业务返回值规范化为 JSON 可序列化数据
