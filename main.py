@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 
-from agent import Agent, AgentToolError, ContextWindowError
+from agent import Agent, AgentModelOutputError, AgentToolError, ContextProtocolError, ContextWindowError
 from agent.memory import create_memory_service
 from integrations.mcp import MCPClientManager, MCPServerConfig
 from tooling.executor import ToolExecutor
@@ -65,7 +65,7 @@ def main():
                     continue
                 try:
                     answer = agent.run(question, thread_id=thread_id)
-                except (AgentToolError, ContextWindowError) as error:
+                except (AgentToolError, AgentModelOutputError, ContextProtocolError, ContextWindowError) as error:
                     print(f"Assistant: 任务已终止，{error}")
                     continue
                 print(f"Assistant: {answer}")

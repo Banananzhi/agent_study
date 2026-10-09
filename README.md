@@ -4,6 +4,35 @@
 
 迁移过程以及手写实现与框架实现的逐项对比见 [LANGCHAIN_MIGRATION.md](LANGCHAIN_MIGRATION.md)。
 
+## 自媒体业务：阶段 1A
+
+已新增独立 `media_operations/` 业务包，支持账号与策略版本、SQLite 事务迁移、Run/Task 输入与结果存储、幂等提交、任务依赖、事件查询、失败与取消记录。保留现有 Agent、工具、记忆数据库和命令行入口。
+
+运行离线存储演示（不需要模型/API Key，默认临时数据库自动清理）：
+
+```powershell
+.\.venv\Scripts\python.exe -m media_operations.demo
+```
+
+演示创建示例账号，保存六个**模拟**阶段结果，并重新打开数据库验证读取；输出 `simulation: true`、幂等检查和 `WAITING_APPROVAL`。这不代表真实调研、文章生成或人工审批已经完成。
+
+需要保留演示数据库时，显式指定路径；每次演示会创建新示例账号：
+
+```powershell
+.\.venv\Scripts\python.exe -m media_operations.demo --database .agent_data/media_demo.sqlite3
+```
+
+业务库默认路径为 `.agent_data/media_operations.sqlite3`；`MediaSettings.from_env()` 支持 `MEDIA_DATABASE_PATH` 及可信身份 `AGENT_TENANT_ID` / `AGENT_USER_ID`。配置加载与依赖组装由后续应用入口负责，业务包不隐式读取 `.env`。
+
+运行业务测试或全部回归：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_media_*.py" -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+本次完整验证：177 项测试通过，其中新增业务测试 32 项。尚未接入真实研究/内容流程、Worker、API 或 Web；取消目前只更新持久化状态并拒绝迟到结果。使用方式、表结构与限制见 [阶段 1A 交付说明](docs/PHASE_1A_STORAGE.md)，后续任务见 [实施计划](docs/IMPLEMENTATION_PLAN.md)。
+
 启动时还会使用 FastMCP Client 连接只读的 DeepWiki 公共 MCP Server，通过 `list_tools()` 动态注册以下工具：
 
 - `deepwiki__ask_wiki_question`
@@ -58,7 +87,33 @@ agent-study/
 
 全局 `ContextManager` 将 Agent 主动使用的上下文限制为 256K Token，并在达到 75%（196608 Token）时自动压缩较早的完整工具执行轮次。Token 估算使用 LangChain `count_tokens_approximately()`，同时计算消息、工具调用参数和每轮请求都会携带的 Tool Schema。LangGraph State 始终保留完整消息，只有本次发给模型的上下文视图会被压缩；压缩结果仍以成对的 `AIMessage(tool_calls)` 和 `ToolMessage` 表达，避免破坏 Function Calling 消息协议。
 
-多轮会话使用持久化滚动摘要管理较早历史。当模型输入达到 196608 Token 时触发，尝试压回 131072 Token；默认保留最近 6 个已完成用户轮次的原文，仍过长时逐轮缩小到最近 2 轮，当前未完成轮次始终完整保留。`session_summary` 目标上限为 12288 Token、硬上限为 16384 Token，`summary_cursor` 用于避免重复摘要同一段历史；两者都随 LangGraph Checkpoint 持久化。如果会话摘要后仍超过目标线，再使用原有工具轮次压缩作为第二层保护。
+多轮会话使用持久化滚动摘要管理较早历史。当模型输入达到 196608 Token 时触发，尝试压回 131072 Token；会话级摘要默认保留最近 6 个已完成用户轮次，仍过长时逐轮缩小到最近 2 轮，不归档当前用户轮次。`session_summary` 目标上限为 12288 Token、硬上限为 16384 Token，`summary_cursor` 只能位于已完成历史用户轮次的末尾，避免重复摘要或隐藏当前问题；两者都随 LangGraph Checkpoint 持久化。
+
+如果会话摘要后仍超过目标线，第二层按从旧到新的顺序逐个压缩完整工具批次，达到目标即停止；必要时也可摘要当前任务较早的结果，最新完整批次最后才处理。每个批次独立摘要，只替换 `ToolMessage.content`，保留原始 `AIMessage`（含参数与思考元数据）、全部 `tool_call_id`、结果状态和其他元数据；批次之间的用户问题、普通回答、系统消息不会被整段替换。因此最近轮次的工具结果在预算紧张时仍可能变成摘要，但用户问题与普通回答不会被第二层删除。摘要失败时按批次确定性降级，摘要包装反而更长则保留原文。未完成工具批次不参与压缩，发送模型前会检查协议并以 `ContextProtocolError` 拦截缺失结果、孤立结果、错误关联或重复 ID，不伪造工具结果。原始 State 不受视图压缩影响，256K 硬上限和现有触发比例保持不变。
+
+上下文预算采用“输入上限 + 输出预留”的口径：`AGENT_CONTEXT_TOKENS` 仍是输入上限，主模型默认预留 16384 Token，并在创建及绑定模型时实际设置请求的 `max_tokens`。有效输入上限为 `min(AGENT_CONTEXT_TOKENS, DEEPSEEK_CONTEXT_TOKENS - AGENT_MAX_OUTPUT_TOKENS)`；默认模型窗口为 1000000，因而 262144 输入上限、196608 压缩线、131072 目标线不变。换成小窗口模型后，输入上限与两条压缩线会自动下调。输出预留是最大生成额度，不是每次必定使用；thinking 内容是否计入该额度遵循供应商 API 的口径。
+
+| 输入分区 | 默认预算 | 超限行为 |
+| --- | --- | --- |
+| 主系统及其他非记忆系统提示 | 8192 Token，软预算 | 只告警，保留完整规则 |
+| 全部工具 Schema | 32768 Token，软预算 | 只告警，不静默删除工具或截断定义 |
+| 召回长期记忆及包装提示 | 4096 Token，硬上限 | 按相关度选择能完整放入预算的条目；同时遵守原有字符上限 |
+| 会话摘要及包装提示 | 12288 Token 目标、16384 Token 硬上限 | 增量摘要与确定性降级，恢复旧摘要时同样校验 |
+| 历史与当前任务 | 扣除实际固定占用后的共享剩余空间 | 使用会话摘要与安全工具压缩，不截断当前问题 |
+
+分区不是固定切块：没有使用的系统或 Schema 额度不会预先扣除；超过软预算的固定信息仍占用共享输入空间，只能压缩其他允许压缩的历史。每次模型调用记录各分区估算占用、共享剩余预算和输出预留；各分区独立估算可能存在非加性开销，硬上限始终以完整消息和完整 Schema 的统一估算为准。无可靠条目边界的旧记忆块超限时整体舍弃，而不是按换行猜测或截断半条事实。辅助模型暂不纳入这套统一输入治理。
+
+以下为新增预算配置示例，未配置时上述默认值自动生效：
+
+```dotenv
+AGENT_CONTEXT_TOKENS=262144
+AGENT_MAX_OUTPUT_TOKENS=16384
+AGENT_SYSTEM_CONTEXT_TOKENS=8192
+AGENT_TOOL_SCHEMA_CONTEXT_TOKENS=32768
+AGENT_MEMORY_RECALL_MAX_TOKENS=4096
+```
+
+供应商报告 `finish_reason=length`（或同义长度结束原因）时，Agent 抛出 `AgentModelOutputError`，不把该响应持久化为完整答案、不执行其中的工具计划、不提取本轮记忆。命令行显示明确原因并允许继续提问，不自动重放可能具有副作用的操作。全部可压缩内容处理后仍超过输入硬上限时，异常会列出各分区占用以便诊断，不擅自截断系统或用户需求。
 
 同一轮的多个原生 `tool_calls` 由 `ToolBatchExecutor` 使用线程池动态调度，默认最大并行数为 4，可通过 `Agent(max_parallel_tools=...)` 调整。调度器只将已经一次性获得全部资源 Lease 的调用提交 Worker，等待锁的调用保留在调度队列中，不占用线程；后续无冲突调用可以先执行，但同资源冲突调用始终保持模型生成时的顺序。`read_file` 申请文件 READ 资源，`create_file` 和 `write_file` 申请 WRITE 资源，因此同文件读读可以并行、读写和写写互斥、不同文件可以并行。最终 ToolResult 与 tool message 始终按原始 `tool_calls` 顺序返回。
 

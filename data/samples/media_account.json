@@ -1,0 +1,17 @@
+{
+  "account": {
+    "platform": "xiaohongshu",
+    "account_name": "AI Agent 技术分享",
+    "positioning": "面向 Java 开发者的 AI Agent 与 AI 应用开发实战",
+    "target_audience": "Java 后端开发者，以及希望转向 AI 应用开发的工程师",
+    "tone": "准确、清晰，使用工程实例解释技术概念",
+    "content_pillars": ["基础教程", "框架解析", "项目实战"],
+    "publishing_frequency": 3,
+    "banned_terms": ["保证涨粉", "百分百准确"]
+  },
+  "strategy": {
+    "pillar_weights": {"基础教程": 0.4, "框架解析": 0.3, "项目实战": 0.3},
+    "quality_rules": ["技术结论附可核查来源", "未知事实标注待核实", "机器审核后仍需人工确认"],
+    "rationale": "阶段 1A 示例配置，不代表真实账号运营数据"
+  }
+}
