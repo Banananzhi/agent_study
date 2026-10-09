@@ -20,3 +20,6 @@ wheels/
 .agent_data/
 
 /output/
+
+# Local tests
+/tests/
