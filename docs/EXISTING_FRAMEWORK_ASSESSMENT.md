@@ -4,7 +4,7 @@
 需求依据：根目录 `AI_MEDIA_AGENT_PROJECT_SPEC.md` v1.0  
 评估范围：当前工作区代码、依赖、配置入口和本地测试；这是阶段 0 的交付，不代表自媒体业务已经实现。
 
-后续进度：阶段 1A 已独立交付，见 [PHASE_1A_STORAGE.md](PHASE_1A_STORAGE.md)。下文保留阶段 0 的原始审计基线，新增业务能力以阶段交付说明为准。
+后续进度：阶段 1A 和 1B 已独立交付，见 [PHASE_1A_STORAGE.md](PHASE_1A_STORAGE.md) 与 [PHASE_1B_RESEARCH.md](PHASE_1B_RESEARCH.md)。下文保留阶段 0 的原始审计基线，新增业务能力以阶段交付说明为准。
 
 ## 1. 结论与实施边界
 

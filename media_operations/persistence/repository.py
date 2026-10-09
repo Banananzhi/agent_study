@@ -10,19 +10,13 @@ from uuid import uuid4
 from pydantic import BaseModel, TypeAdapter
 
 from media_operations.persistence.migrate import migrate, open_database
+from media_operations.persistence.errors import ConflictError, NotFoundError
+from media_operations.persistence.research_repository import ResearchRepositoryMixin
 from media_operations.schemas import (
     AccountBrief, AccountCreate, AccountStatus, AgentRun, AgentTask,
     AgentTaskResult, ContentStrategy, OwnerScope, Payload, RunCreate,
     RunEvent, RunStatus, StrategyCreate, TaskError, TaskStatus,
 )
-
-
-class NotFoundError(LookupError):
-    """对象不存在或不属于当前可信身份/账号，不泄露其他账号信息。"""
-
-
-class ConflictError(ValueError):
-    """版本、幂等键或状态冲突。"""
 
 
 PAYLOAD_ADAPTER = TypeAdapter(Payload)
@@ -47,7 +41,7 @@ def _now():
     return datetime.now(UTC).isoformat()
 
 
-class MediaRepository:
+class MediaRepository(ResearchRepositoryMixin):
     """归属由构造参数绑定；所有 Run/Task 查询还必须提供 account_id。"""
 
     def __init__(self, path: str | Path = ".agent_data/media_operations.sqlite3", *, owner=None):

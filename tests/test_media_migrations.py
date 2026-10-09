@@ -23,7 +23,7 @@ class MediaMigrationTests(unittest.TestCase):
         migrate(self.database)
         migrate(self.database)
         with closing(sqlite3.connect(self.database)) as connection, connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall(), [(1,), (2,)])
+            self.assertEqual(connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall(), [(1,), (2,), (3,)])
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertTrue({"media_account", "account_revision", "account_goal", "agent_run", "agent_task", "run_event"} <= names)

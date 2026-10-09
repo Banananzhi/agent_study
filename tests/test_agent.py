@@ -1,12 +1,19 @@
 import copy
 import io
 import json
+import os
+import threading
+import tempfile
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from agent import Agent, AgentToolError
-from tool_result import ErrorCode, ToolResult
-from tools import TOOLS
+from agent.summarizer import ResultSummarizer
+from tooling.registry import TOOLS, format_tool_action
+from tooling.resources import ResourceLockManager
+from tooling.result import ErrorCode, ToolResult
 
 
 class FakeExecutor:
@@ -17,6 +24,27 @@ class FakeExecutor:
         self.results = iter(results)
         self.registry = {} if registry is None else registry
         self.calls = []
+        self.lock_manager = ResourceLockManager()
+        self.result_lock = threading.Lock()
+
+    # 为批量调度器准备带资源声明的测试调用
+    # name：测试工具名称
+    # args：测试工具参数
+    def prepare(self, name, args):
+        # tool：测试注册表中可选的真实工具定义
+        tool = self.registry.get(name)
+        # resources：真实工具定义能够提供的本次资源声明
+        resources = tool.resolve_resources(args) if tool is not None else ()
+        return SimpleNamespace(name=name, args=args, resources=resources)
+
+    # 在调度器预留的资源租约中返回下一个测试结果
+    # prepared：测试 prepare 生成的调用字典
+    # resource_lease：批量调度器预留的资源租约
+    def execute_prepared(self, prepared, resource_lease):
+        with resource_lease:
+            with self.result_lock:
+                self.calls.append((prepared.name, prepared.args))
+                return next(self.results)
 
     # 返回下一个预置工具结果
     # name：模型选择的工具名称
@@ -24,6 +52,27 @@ class FakeExecutor:
     def execute(self, name, args):
         self.calls.append((name, args))
         return next(self.results)
+
+
+class FakeSummarizer:
+    # 初始化可记录调用的测试摘要器
+    # summary：每次摘要调用返回的固定文本
+    # error：需要模拟的摘要异常
+    def __init__(self, summary="工具结果摘要", error=None):
+        self.summary = summary
+        self.error = error
+        self.calls = []
+
+    # 记录完整工具数据并返回预置摘要
+    # tool_name：待摘要的工具名称
+    # value：待摘要的完整工具业务数据
+    # goal：用户当前任务目标
+    # max_chars：摘要的目标最大字符数
+    def summarize(self, tool_name, value, goal, max_chars):
+        self.calls.append((tool_name, value, goal, max_chars))
+        if self.error:
+            raise self.error
+        return self.summary
 
 
 class ScriptedAgent(Agent):
@@ -70,32 +119,58 @@ def final_response(answer):
 
 
 class AgentFunctionCallingTests(unittest.TestCase):
-    # 验证 think 会通过 API 原生 tools 字段发送工具 Schema
-    def test_think_uses_native_function_calling_request(self):
-        # response_body：模拟 DeepSeek 返回的最终 assistant 响应
-        response_body = {
-            "choices": [{"message": final_response("直接答案")}],
-        }
+    # 验证 Action 日志按 Schema 顺序显示查询文本而不是首个 JSON 参数
+    def test_action_log_uses_schema_argument_order(self):
+        # action：模型将 count 放在 query 前面时生成的搜索 Action 日志
+        action = format_tool_action(
+            "web_search",
+            {"count": 5, "query": "华为 Pura 90 官方起售价"},
+            TOOLS,
+        )
 
-        # response_bytes：可供 json.load 读取的模拟 HTTP 响应字节
-        response_bytes = json.dumps(response_body).encode("utf-8")
+        self.assertEqual(
+            action,
+            "WebSearch[query=华为 Pura 90 官方起售价, count=5]",
+        )
 
-        # agent：用于验证真实 think 请求体的 Agent
-        agent = Agent()
-        agent.api_key = "test-key"
+    # 验证写文件 Action 日志不会输出完整文件内容
+    def test_action_log_hides_large_content(self):
+        # action：包含较长文件正文的写入 Action 日志
+        action = format_tool_action(
+            "write_file",
+            {"content": "敏感正文" * 100, "path": "output/report.md", "offset": 0},
+            TOOLS,
+        )
 
-        with patch("agent.urllib.request.urlopen", return_value=io.BytesIO(response_bytes)) as urlopen:
-            agent.think([{"role": "user", "content": "你好"}])
+        self.assertIn("path=output/report.md", action)
+        self.assertIn("content=<400 字符>", action)
+        self.assertNotIn("敏感正文", action)
 
-        # request：think 向 DeepSeek 接口构造的 HTTP 请求
-        request = urlopen.call_args.args[0]
+    # 验证 think 通过 LangChain bind_tools 绑定当前注册表并调用模型
+    def test_think_uses_langchain_tool_binding(self):
+        # bound_model：模拟 bind_tools 返回的 LangChain Runnable
+        bound_model = MagicMock()
+        bound_model.invoke.return_value = AIMessage(content="直接答案")
+        # chat_model：模拟可绑定工具的 LangChain ChatModel
+        chat_model = MagicMock()
+        chat_model.bind_tools.return_value = bound_model
+        # agent：注入 ChatModel，避免测试发起真实网络请求
+        agent = Agent(chat_model=chat_model)
 
-        # request_body：从 HTTP 请求中解析出的 Function Calling 请求体
-        request_body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(request_body["tool_choice"], "auto")
-        self.assertEqual(len(request_body["tools"]), 4)
-        self.assertNotIn("response_format", request_body)
-        self.assertTrue(all("返回值：" in item["function"]["description"] for item in request_body["tools"]))
+        # message：LangChain 标准化后的模型响应
+        message = agent.think([HumanMessage("你好")])
+
+        # schemas：传递给 bind_tools 的 Function Calling 工具定义
+        schemas = chat_model.bind_tools.call_args.args[0]
+        self.assertEqual(chat_model.bind_tools.call_args.kwargs["tool_choice"], "auto")
+        self.assertEqual(len(schemas), len(TOOLS))
+        # tool_names：LangChain 实际绑定的工具注册名称集合
+        tool_names = {item["function"]["name"] for item in schemas}
+        self.assertIn("create_file", tool_names)
+        self.assertIn("write_file", tool_names)
+        self.assertTrue(all("返回值：" in item["function"]["description"] for item in schemas))
+        bound_model.invoke.assert_called_once()
+        self.assertEqual(message.content, "直接答案")
 
     # 验证可恢复错误会使用 tool 消息返回模型修正
     def test_model_recoverable_error_returns_as_tool_message(self):
@@ -124,9 +199,9 @@ class AgentFunctionCallingTests(unittest.TestCase):
         tool_message = agent.seen_messages[1][-1]
 
         # observation：错误工具消息中的结构化观察结果
-        observation = json.loads(tool_message["content"])
-        self.assertEqual(tool_message["role"], "tool")
-        self.assertEqual(tool_message["tool_call_id"], "call_1")
+        observation = json.loads(tool_message.content)
+        self.assertEqual(tool_message.type, "tool")
+        self.assertEqual(tool_message.tool_call_id, "call_1")
         self.assertTrue(observation["error"]["model_recoverable"])
         self.assertEqual(observation["error"]["suggestions"], ["calculator"])
 
@@ -181,11 +256,131 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(agent.run("你好"), "直接答案")
         self.assertEqual(len(agent.seen_messages), 1)
 
+    # 验证相同 thread_id 可以在 Agent 重启后恢复上一轮会话消息
+    def test_sqlite_checkpointer_restores_multi_turn_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            # checkpoint_path：测试专用的 SQLite 会话文件
+            checkpoint_path = os.path.join(temporary_directory, "sessions.sqlite3")
+            # first_agent：写入第一轮会话并模拟程序退出的 Agent
+            first_agent = ScriptedAgent(
+                [final_response("好的，你叫小王。")],
+                tool_executor=FakeExecutor([]),
+                checkpoint_path=checkpoint_path,
+            )
+            try:
+                first_agent.run("我叫小王", thread_id="conversation-001")
+            finally:
+                first_agent.close()
+
+            # second_agent：重新打开同一 SQLite 文件并继续同一会话的 Agent
+            second_agent = ScriptedAgent(
+                [final_response("你叫小王。")],
+                tool_executor=FakeExecutor([]),
+                checkpoint_path=checkpoint_path,
+            )
+            try:
+                answer = second_agent.run(
+                    "我叫什么？",
+                    thread_id="conversation-001",
+                )
+                # restored_messages：第二轮请求发给模型的完整会话上下文
+                restored_messages = second_agent.seen_messages[0]
+                self.assertEqual(answer, "你叫小王。")
+                self.assertEqual(
+                    [message.type for message in restored_messages],
+                    ["system", "human", "ai", "human"],
+                )
+                self.assertEqual(restored_messages[1].content, "我叫小王")
+                self.assertEqual(restored_messages[2].content, "好的，你叫小王。")
+                self.assertEqual(restored_messages[3].content, "我叫什么？")
+            finally:
+                second_agent.close()
+
+    # 验证滚动会话摘要和游标会随 SQLite Checkpoint 跨 Agent 重启恢复
+    def test_sqlite_checkpointer_restores_session_summary(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            # checkpoint_path：测试滚动摘要持久化的 SQLite 文件
+            checkpoint_path = os.path.join(temporary_directory, "summary.sqlite3")
+            # summarizer：在小上下文预算测试中返回固定会话摘要
+            summarizer = FakeSummarizer("已持久化的会话摘要")
+            # responses：用较长最终回答快速触发会话历史压缩
+            responses = [
+                final_response(str(index) * 1300)
+                for index in range(1, 7)
+            ]
+            # first_agent：连续写入多轮对话并生成持久化摘要的 Agent
+            first_agent = ScriptedAgent(
+                responses,
+                tool_executor=FakeExecutor([]),
+                result_summarizer=summarizer,
+                checkpoint_path=checkpoint_path,
+                max_context_tokens=4096,
+                context_compression_ratio=0.75,
+                context_target_ratio=0.5,
+                recent_turns_to_keep=6,
+                minimum_recent_turns=2,
+                session_summary_target_tokens=128,
+                session_summary_max_tokens=256,
+            )
+            try:
+                for turn_index in range(1, 7):
+                    first_agent.run(
+                        f"第 {turn_index} 轮问题",
+                        thread_id="summary-session",
+                    )
+                # saved_state：第一个 Agent 结束前 SQLite 中的最新会话状态
+                saved_state = first_agent.graph.get_state({
+                    "configurable": {"thread_id": "summary-session"},
+                }).values
+                self.assertEqual(
+                    saved_state["session_summary"],
+                    "已持久化的会话摘要",
+                )
+                self.assertIsNotNone(saved_state["summary_cursor"])
+            finally:
+                first_agent.close()
+
+            # second_agent：重新打开 SQLite 并恢复摘要视图的 Agent
+            second_agent = ScriptedAgent(
+                [final_response("继续对话")],
+                tool_executor=FakeExecutor([]),
+                result_summarizer=FakeSummarizer("不应重复生成"),
+                checkpoint_path=checkpoint_path,
+                max_context_tokens=4096,
+                context_compression_ratio=0.75,
+                context_target_ratio=0.5,
+                recent_turns_to_keep=6,
+                minimum_recent_turns=2,
+                session_summary_target_tokens=128,
+                session_summary_max_tokens=256,
+            )
+            try:
+                second_agent.run("继续", thread_id="summary-session")
+                # summary_messages：重启后本次模型输入中的持久化摘要消息
+                summary_messages = [
+                    message
+                    for message in second_agent.seen_messages[0]
+                    if isinstance(message, SystemMessage)
+                    and message.additional_kwargs.get("session_summary")
+                ]
+                self.assertEqual(len(summary_messages), 1)
+                self.assertIn("已持久化的会话摘要", summary_messages[0].content)
+            finally:
+                second_agent.close()
+
     # 验证原生 arguments 不是合法 JSON 时会交给模型修正
     def test_invalid_native_arguments_are_recoverable(self):
         # invalid_response：arguments 字段不是合法 JSON 的原生响应
-        invalid_response = tool_response("calculator")
-        invalid_response["tool_calls"][0]["function"]["arguments"] = "{"
+        invalid_response = AIMessage(
+            content="",
+            invalid_tool_calls=[{
+                "name": "calculator",
+                "args": "{",
+                "id": "call_1",
+                "error": "工具参数不是合法 JSON",
+                "type": "invalid_tool_call",
+            }],
+        )
         agent = ScriptedAgent(
             [invalid_response, final_response("已终止")],
             tool_executor=FakeExecutor([]),
@@ -194,7 +389,7 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(agent.run("计算"), "已终止")
 
         # observation：模型第二轮收到的参数解析错误
-        observation = json.loads(agent.seen_messages[1][-1]["content"])
+        observation = json.loads(agent.seen_messages[1][-1].content)
         self.assertEqual(observation["error"]["code"], "invalid_arguments")
         self.assertTrue(observation["error"]["model_recoverable"])
 
@@ -224,9 +419,9 @@ class AgentFunctionCallingTests(unittest.TestCase):
 
         # tool_messages：第二轮模型调用前的全部工具结果消息
         tool_messages = agent.seen_messages[1][-2:]
-        self.assertEqual([item["role"] for item in tool_messages], ["tool", "tool"])
+        self.assertEqual([item.type for item in tool_messages], ["tool", "tool"])
         self.assertEqual(
-            [item["tool_call_id"] for item in tool_messages],
+            [item.tool_call_id for item in tool_messages],
             ["call_1", "call_2"],
         )
 
@@ -247,7 +442,7 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(len(executor.calls), 1)
 
         # observation：第三轮模型调用前收到的重复 Action 错误
-        observation = json.loads(agent.seen_messages[2][-1]["content"])
+        observation = json.loads(agent.seen_messages[2][-1].content)
         self.assertEqual(observation["error"]["code"], "repeated_action")
         self.assertTrue(observation["error"]["model_recoverable"])
         self.assertEqual(observation["attempts"], 0)
@@ -287,7 +482,7 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(len(executor.calls), 2)
         # observations：第三轮模型调用前收到的两个重复 Action 结果
         observations = [
-            json.loads(message["content"])
+            json.loads(message.content)
             for message in agent.seen_messages[2][-2:]
         ]
         self.assertEqual(
@@ -336,11 +531,13 @@ class AgentFunctionCallingTests(unittest.TestCase):
         self.assertEqual(len(executor.calls), 3)
 
     # 验证 Agent 返回模型的 tool 消息不超过配置长度
-    def test_agent_limits_tool_message_length(self):
+    def test_agent_summarizes_long_tool_result(self):
         # executor：返回超长网页内容的测试执行器
         executor = FakeExecutor([
             ToolResult.success("read_webpage", "网页内容" * 3000),
-        ])
+        ], registry=TOOLS)
+        # summarizer：用于验证完整工具值和用户目标的测试摘要器
+        summarizer = FakeSummarizer("网页关键内容")
         agent = ScriptedAgent(
             [
                 tool_response("read_webpage", {"url": "https://example.com"}, "call_1"),
@@ -348,14 +545,74 @@ class AgentFunctionCallingTests(unittest.TestCase):
             ],
             tool_executor=executor,
             max_observation_chars=800,
+            result_summarizer=summarizer,
         )
 
         self.assertEqual(agent.run("读取网页"), "完成")
 
         # tool_message：第二轮模型调用前收到的受限工具消息
         tool_message = agent.seen_messages[1][-1]
-        self.assertLessEqual(len(tool_message["content"]), 800)
-        self.assertTrue(json.loads(tool_message["content"])["truncation"]["truncated"])
+        # observation：包含摘要文本和原始长度元数据的工具观察
+        observation = json.loads(tool_message.content)
+        self.assertLessEqual(len(tool_message.content), 800)
+        self.assertEqual(observation["value"], "网页关键内容")
+        self.assertTrue(observation["summarization"]["summarized"])
+        self.assertEqual(summarizer.calls[0][0], "read_webpage")
+        self.assertEqual(len(summarizer.calls[0][1]), 12000)
+
+    # 验证摘要模型失败时 Agent 会回退到原有统一截断
+    def test_summary_failure_falls_back_to_truncation(self):
+        # executor：返回超长搜索结果的测试执行器
+        executor = FakeExecutor(
+            [ToolResult.success("web_search", "搜索结果" * 3000)],
+            registry=TOOLS,
+        )
+        # summarizer：模拟请求超时的测试摘要器
+        summarizer = FakeSummarizer(error=TimeoutError("摘要超时"))
+        agent = ScriptedAgent(
+            [
+                tool_response("web_search", {"query": "测试"}, "call_1"),
+                final_response("完成"),
+            ],
+            tool_executor=executor,
+            max_observation_chars=800,
+            result_summarizer=summarizer,
+        )
+
+        self.assertEqual(agent.run("搜索"), "完成")
+        # observation：摘要失败后使用的受限工具结果
+        observation = json.loads(agent.seen_messages[1][-1].content)
+        self.assertTrue(observation["truncation"]["truncated"])
+
+    # 验证公共摘要器会分块处理完整结果且摘要请求不携带工具权限
+    def test_result_summarizer_uses_tool_free_chunk_requests(self):
+        # response_body：每次摘要请求的模拟模型响应
+        response_body = {
+            "choices": [{"message": final_response("分块摘要")}],
+        }
+
+        # fake_urlopen：为每次分块和汇总请求创建独立响应流
+        def fake_urlopen(request, timeout):
+            return io.BytesIO(json.dumps(response_body).encode("utf-8"))
+
+        # summarizer：使用较小分块验证 map-reduce 摘要流程的公共组件
+        summarizer = ResultSummarizer(
+            model="deepseek-chat",
+            api_url="https://api.deepseek.com",
+            api_key="test-key",
+            chunk_chars=1000,
+        )
+        with patch("agent.summarizer.urllib.request.urlopen", side_effect=fake_urlopen) as urlopen:
+            # summary：三个原始分块经过一次最终汇总后的摘要
+            summary = summarizer.summarize("read_webpage", "x" * 2500, "测试目标", 500)
+
+        self.assertEqual(summary, "分块摘要")
+        self.assertEqual(urlopen.call_count, 4)
+        for call in urlopen.call_args_list:
+            # request_body：当前摘要 HTTP 请求的 JSON 请求体
+            request_body = json.loads(call.args[0].data.decode("utf-8"))
+            self.assertNotIn("tools", request_body)
+            self.assertNotIn("tool_choice", request_body)
 
 
 if __name__ == "__main__":

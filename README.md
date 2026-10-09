@@ -4,9 +4,20 @@
 
 迁移过程以及手写实现与框架实现的逐项对比见 [LANGCHAIN_MIGRATION.md](LANGCHAIN_MIGRATION.md)。
 
-## 自媒体业务：阶段 1A
+## 自媒体业务：阶段 1A / 1B
 
 已新增独立 `media_operations/` 业务包，支持账号与策略版本、SQLite 事务迁移、Run/Task 输入与结果存储、幂等提交、任务依赖、事件查询、失败与取消记录。保留现有 Agent、工具、记忆数据库和命令行入口。
+
+阶段 1B 新增可注入现有 Agent 的三个工具：`search_web`、`extract_web_page`、`search_account_knowledge`，支持结构化来源、来源快照和工具执行轨迹。工具绑定当前账号及正在运行的 research Task；正文和摘要标为不可信资料，取得内容不表示事实已核实。未修改 Agent 核心或原 CLI 的工具配置。
+
+运行离线研究演示（脚本模型 + 模拟 HTTP，通过现有 Agent 图实际执行工具）：
+
+```powershell
+.\.venv\Scripts\python.exe -m media_operations.research_demo
+.\.venv\Scripts\python.exe -m media_operations.research_demo --database .agent_data/research_demo.sqlite3
+```
+
+输出 `simulation: true`、三种来源及三条执行轨迹。真实搜索使用 `BOCHA_API_KEY`，本地知识放在 `MEDIA_KNOWLEDGE_ROOT/<account_id>/**/*.md`，默认根目录为 `.agent_data/media_knowledge`。配置加载由入口负责；接入方法与限制见 [阶段 1B 交付说明](docs/PHASE_1B_RESEARCH.md)。
 
 运行离线存储演示（不需要模型/API Key，默认临时数据库自动清理）：
 
@@ -31,7 +42,7 @@
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-本次完整验证：177 项测试通过，其中新增业务测试 32 项。尚未接入真实研究/内容流程、Worker、API 或 Web；取消目前只更新持久化状态并拒绝迟到结果。使用方式、表结构与限制见 [阶段 1A 交付说明](docs/PHASE_1A_STORAGE.md)，后续任务见 [实施计划](docs/IMPLEMENTATION_PLAN.md)。
+当前完整回归：222 项用例，221 项通过，1 项因 Windows 符号链接权限不足跳过；其中业务用例 77 项。阶段 1A 的存储基线为 177 项通过。尚未进行真实外部搜索验证，也未实现内容生产闭环、Worker、API 或 Web；取消目前在调用/提交边界检查。存储说明见 [阶段 1A 交付说明](docs/PHASE_1A_STORAGE.md)，下一步为 [实施计划](docs/IMPLEMENTATION_PLAN.md) 的 1C 生产闭环。
 
 启动时还会使用 FastMCP Client 连接只读的 DeepWiki 公共 MCP Server，通过 `list_tools()` 动态注册以下工具：
 
